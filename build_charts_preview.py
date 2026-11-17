@@ -179,15 +179,43 @@ def change_label(row) -> str:
     return "; ".join(parts) if parts else "-"
 
 
+LATAM = ["BR", "CL", "CO", "MX", "PE"]
+
+
+def em_in_acwi() -> float:
+    """Peso do EM no ACWI usado no relatório de fluxos (Calc_Ctry_Weights, 'ACWI weight')."""
+    raw = pd.read_excel(FLOWS, sheet_name="Calc_Ctry_Weights", header=None)
+    pos = np.argwhere(raw.astype(str).values == "ACWI weight")[0]
+    return float(raw.iat[pos[0], pos[1] + 1])
+
+
+def index_deltas(bm: pd.DataFrame) -> pd.DataFrame:
+    """Método por índice: variação do peso de cada papel no MSCI EM Latin America e no MSCI EM (bps), pelo
+    market cap no índice antes e depois da revisão. O fundo regional ou global vende o que sai de um papel e
+    reinveste no índice inteiro, não só no país (o relatório de 11/11 reinvestia no país)."""
+    cur = bm["current_index_market_cap"].fillna(0)
+    pf = bm["pro_forma_index_market_cap"].fillna(0)
+    la = bm["cty_code"].isin(LATAM)
+    out = pd.DataFrame({"security_ticker": bm["security_ticker"]})
+    out["d_em"] = (pf / pf.sum() - cur / cur.sum()) * 1e4
+    out["d_la"] = np.where(la, (pf / pf[la].sum() - cur / cur[la].sum()) * 1e4, np.nan)
+    return out.set_index("security_ticker")
+
+
 def brazil_table(bm: pd.DataFrame) -> pd.DataFrame:
     bz = _calc("Calc_BZ")
     bmi = bm.set_index("security_ticker")
     bz["change"] = [change_label(bmi.loc[b]) if b in bmi.index else "-" for b in bz["bbg"]]
     bz.loc[bz["ticker"] == "JBS", "change"] = "Deletion (reclassified as US)"
-    bz["p_regional"] = bz["p_latam"] + bz["p_em"] + bz["p_acwi"]
-    # JBS: saída do Standard + EM IMI e ACWI ex USA IMI, líquida da entrada nos índices americanos
+    dl = index_deltas(bm)
+    assert bz["bbg"].isin(dl.index).all(), bz.loc[~bz["bbg"].isin(dl.index), "bbg"].tolist()
+    bz["d_la"] = bz["bbg"].map(dl["d_la"])
+    bz["d_em"] = bz["bbg"].map(dl["d_em"])
+    # JBS: além da saída do Standard, vendem os fundos de EM IMI e ACWI ex USA IMI e compram os de small cap
+    # americanos (aba JBS_migracao); entra como "outro passivo", o líquido além do Standard (−55 mi)
     j = bz["ticker"] == "JBS"
-    bz.loc[j, "p_regional"] = jbs_net_passive() - bz.loc[j, "p_country"]
+    bz["p_other"] = 0.0
+    bz.loc[j, "p_other"] = jbs_net_passive() - bz.loc[j, "p_total"]
     ctrl = {t: c for c, ts in CONTROL_BR.items() for t in ts}
     missing = set(bz["ticker"]) - set(ctrl)
     assert not missing, f"sem control group: {missing}"
@@ -205,10 +233,12 @@ def mexico_table(bm: pd.DataFrame) -> pd.DataFrame:
     mx["w_new"] = mx["pro_forma_index_market_cap"] / mx["pro_forma_index_market_cap"].sum()
     mx["change"] = mx.apply(change_label, axis=1)
     lt["key"] = lt["ticker"].astype(str)
-    m = mx.merge(lt[["key", "sector", "adtv", "p_latam", "p_em", "p_acwi"]], left_on="ticker",
-                 right_on="key", how="left", validate="1:1")
+    m = mx.merge(lt[["key", "sector", "adtv"]], left_on="ticker", right_on="key", how="left", validate="1:1")
     assert m["adtv"].notna().all(), m.loc[m["adtv"].isna(), "ticker"].tolist()
-    m["p_regional"] = m["p_latam"] + m["p_em"] + m["p_acwi"]
+    dl = index_deltas(bm)
+    m["d_la"] = m["security_ticker"].map(dl["d_la"])
+    m["d_em"] = m["security_ticker"].map(dl["d_em"])
+    m["p_other"] = 0.0
     m["name"] = m["ticker"].map(MX_NAMES)
     m["sector"] = m["sector"].map(lambda s: SECTOR_SHORT.get(s, s))
     m["control"] = "MEXBOL"
@@ -332,6 +362,9 @@ COLS = [  # chave, cabeçalho, grupo, largura, formato
     ("r_cut", "Since cutoff", "Relative return (stock - control, p.p.)", 9, "0.0%"),
     ("r_day", "Day after", "Relative return (stock - control, p.p.)", 9, "0.0%"),
     ("r_ann", "Since announcement", "Relative return (stock - control, p.p.)", 12.5, "0.0%"),
+    ("d_la", "MSCI EM Latin America", "Change in weight (bps) and other flows", 10, "0.00"),
+    ("d_em", "MSCI EM", "Change in weight (bps) and other flows", 9, "0.000"),
+    ("p_other", "Other passive (US$ mn)", "Change in weight (bps) and other flows", 10, "#,##0.0"),
     ("series", "Price series (Prices tab)", "Lookup key", 11, None),
 ]
 COLIDX = {k: i + 1 for i, (k, *_) in enumerate(COLS)}
@@ -401,7 +434,9 @@ def write_market_tab(wb, title: str, df: pd.DataFrame, aum_name: str, subtitle: 
             "dw": f"=({L('w_new')}{rr}-{L('w_cur')}{rr})*10000",
             "adtv": float(row.adtv),
             "pc": f"={L('dw')}{rr}/10000*{aum_name}",
-            "pr": float(row.p_regional),
+            "pr": (f"=({L('d_la')}{rr}*AUM_LATAM+{L('d_em')}{rr}*(AUM_EM+EM_IN_ACWI*AUM_ACWI))/10000"
+                   f"+{L('p_other')}{rr}"),
+            "d_la": float(row.d_la), "d_em": float(row.d_em), "p_other": float(row.p_other),
             "pt": f"={L('pc')}{rr}+{L('pr')}{rr}",
             "tt": f"={L('pt')}{rr}*(1+ActiveRatio)",
             "ip": f"={L('pt')}{rr}/{L('adtv')}{rr}",
@@ -434,7 +469,7 @@ def write_market_tab(wb, title: str, df: pd.DataFrame, aum_name: str, subtitle: 
 
     # negativos em vermelho XP
     for k in ("dw", "pc", "pr", "pt", "tt", "ip", "it", "s_cut", "s_day", "s_ann", "c_cut", "c_day", "c_ann",
-              "r_cut", "r_day", "r_ann"):
+              "r_cut", "r_day", "r_ann", "d_la", "d_em", "p_other"):
         rng = f"{L(k)}{R0}:{L(k)}{last_r}"
         ws.conditional_formatting.add(rng, CellIsRule(operator="lessThan", formula=["0"], font=Font(color=RED)))
 
@@ -587,6 +622,14 @@ def write_basis(wb, last: date | None, aum: dict, aum_mx: float, aum_mx_src: str
         ("MSCI Brazil passive AUM (US$ mn)", aum["Brazil"][1], "AUM_BR",
          "Lipper, funds benchmarked to MSCI Brazil (same base as the published flows report of 11-Nov-2026)"),
         ("MSCI Mexico passive AUM (US$ mn)", aum_mx, "AUM_MX", aum_mx_src),
+        ("MSCI EM Latin America passive AUM (US$ mn)", aum["Latam"][1], "AUM_LATAM",
+         "Lipper, passive funds benchmarked to MSCI EM Latin America (flows report of 11-Nov-2026)"),
+        ("MSCI EM passive AUM (US$ mn)", aum["EM"][1], "AUM_EM",
+         "Lipper, passive funds benchmarked to the MSCI EM Standard index (flows report of 11-Nov-2026)"),
+        ("MSCI ACWI passive AUM (US$ mn)", aum["ACWI"][1], "AUM_ACWI",
+         "Lipper, passive funds benchmarked to MSCI ACWI (flows report of 11-Nov-2026)"),
+        ("EM weight in the ACWI", em_in_acwi(), "EM_IN_ACWI",
+         "A stock's change in weight in the ACWI = its change in the EM x this weight"),
         ("Active flows as a multiple of passive", 0.5, "ActiveRatio",
          "House convention: total = passive x 1.5 (calibrated on implementation-day volume, Feb/25 to Aug/26)"),
     ]
@@ -594,19 +637,13 @@ def write_basis(wb, last: date | None, aum: dict, aum_mx: float, aum_mx_src: str
         r = r0 + 1 + i
         ws.cell(r, 1, lab).font = F_BOLD
         c = ws.cell(r, 2, val)
-        c.number_format = "#,##0.0" if val > 5 else "0.00"
+        c.number_format = "#,##0.0" if val > 5 else "0.00%" if nm == "EM_IN_ACWI" else "0.00"
         c.font, c.fill = F_BOLD, FILL_INPUT
         ws.cell(r, 3, nm).font = F_NOTE
         ws.cell(r, 4, note).font = F_BODY
         ws.cell(r, 4).alignment = Alignment(wrap_text=True, vertical="top")
         wb.defined_names[nm] = DefinedName(nm, attr_text=f"Basis!$B${r}")
-    r = r0 + 1 + len(params)
-    ws.cell(r, 1, "Regional and global passive AUM (US$ mn, reference)").font = F_BOLD
-    ws.cell(r, 4, f"MSCI EM Latin America {aum['Latam'][1]:,.0f}; MSCI EM {aum['EM'][1]:,.0f}; "
-                  f"MSCI ACWI {aum['ACWI'][1]:,.0f}. Already applied in the 'regional & global' column "
-                  "(values from the published flows report).").font = F_BODY
-    ws.cell(r, 4).alignment = Alignment(wrap_text=True, vertical="top")
-    ws.row_dimensions[r].height = 24
+    r = r0 + len(params)
 
     r1 = r + 2
     head(r1, ["Control groups", "B3 / Yahoo code", "Bloomberg ticker", "Used for"])
@@ -627,9 +664,15 @@ def write_basis(wb, last: date | None, aum: dict, aum_mx: float, aum_mx_src: str
                      "(no additions or deletions this cycle)."),
         ("Weights", "MSCI pro forma file of the November 2026 Index Review (prices of 20-Oct-2026). Mexico weights are "
                     "within MSCI Mexico (index market cap over the sum of the 21 members)."),
-        ("Flows", "Passive: country funds = change in weight x country passive AUM; regional & global = MSCI EM Latin "
-                  "America, EM and ACWI passive funds, from the published flows report. Total = passive x (1 + active "
-                  "multiple). Impact = flow / 3M ADTV."),
+        ("Flows", "Each group of passive funds trades the change in the stock's weight in its own index: country "
+                  "funds = change in weight in MSCI Brazil/Mexico x country AUM; regional & global = change in weight "
+                  "in MSCI EM Latin America x LatAm AUM + change in weight in MSCI EM x (EM AUM + EM weight in ACWI x "
+                  "ACWI AUM). Total = passive x (1 + active multiple). Impact = flow / 3M ADTV."),
+        ("vs. the report", "The flows report of 11-Nov-2026 scaled the regional and global funds by the country's weight "
+                           "(as if they reinvested in the country what they sell of a deleted name). Here they reinvest "
+                           "across their whole index, as they do. Names with index events barely change (JBS, AXIA3, "
+                           "TIMS3, GMEXICOB); names without events get smaller inflows (e.g., PETR4), and the country's "
+                           "net flow follows its change in weight in the EM (Brazil 5.03% to 5.00%)."),
         ("JBS", "Net of the whole migration, as published: exit from the Standard indices and from EM IMI and ACWI ex "
                 "USA IMI funds, minus purchases by MSCI USA Small Cap, USA IMI and World Small Cap funds "
                 "(passive -302 mn; total -453 mn)."),
@@ -723,6 +766,9 @@ def main():
         px.to_csv(DATA / f"prices_{last:%Y%m%d}.csv")
 
     # ordena pelo impacto total (em módulo), que é o que interessa a quem opera no dia
+    w_acwi = em_in_acwi()
+    for df in (bz, mx):
+        df["p_regional"] = (df["d_la"] * aum["Latam"][1] + df["d_em"] * (aum["EM"][1] + w_acwi * aum["ACWI"][1])) / 1e4             + df["p_other"]
     bz["_imp"] = ((bz["delta_bps"] / 1e4 * aum["Brazil"][1] + bz["p_regional"]) * 1.5 / bz["adtv"]).abs()
     bz = bz.sort_values("_imp", ascending=False)
     mx["_imp"] = ((mx["delta_bps"] / 1e4 * aum_mx + mx["p_regional"]) * 1.5 / mx["adtv"]).abs()
