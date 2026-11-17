@@ -99,6 +99,17 @@ SECTOR_SHORT = {
 }
 
 H = {"User-Agent": "Mozilla/5.0"}
+GICS_SECTOR = {10: "Energy", 15: "Materials", 20: "Industrials", 25: "Consumer Discretionary",
+               30: "Consumer Staples", 35: "Health Care", 40: "Financials", 45: "Information Technology",
+               50: "Communication Services", 55: "Utilities", 60: "Real Estate"}
+
+
+def gics_map(bm: pd.DataFrame) -> pd.Series:
+    """Setor GICS por security_ticker: dois primeiros dígitos do código GICS do pro forma (ou do atual, para
+    quem sai do índice, como a JBS)."""
+    code = bm["pro_forma_gics_code"].fillna(bm["current_gics_code"])
+    return pd.Series((code // 1e6).map(lambda c: GICS_SECTOR.get(int(c)) if pd.notna(c) else None).values,
+                     index=bm["security_ticker"]).groupby(level=0).first()
 
 
 # ================================================================ dados do relatório de fluxos
@@ -247,6 +258,8 @@ def brazil_table(bm: pd.DataFrame) -> pd.DataFrame:
     assert not missing, f"sem control group: {missing}"
     bz["control"] = bz["ticker"].map(ctrl)
     bz["series"] = bz["ticker"].map(lambda t: BDR.get(t, t))
+    bz["gics"] = bz["bbg"].map(gics_map(bm))
+    assert bz["gics"].notna().all(), bz.loc[bz["gics"].isna(), "ticker"].tolist()
     return bz
 
 
@@ -271,6 +284,8 @@ def mexico_table(bm: pd.DataFrame) -> pd.DataFrame:
     m["series"] = m["ticker"].str.replace("*", "", regex=False)
     m["yahoo"] = m["ticker"].map(lambda t: MX_YAHOO.get(t, t.replace("*", "") + ".MX"))
     m["delta_bps"] = (m["w_new"] - m["w_cur"]) * 1e4
+    m["gics"] = m["security_ticker"].map(gics_map(bm))
+    assert m["gics"].notna().all(), m.loc[m["gics"].isna(), "ticker"].tolist()
     return m
 
 
@@ -393,6 +408,7 @@ COLS = [  # chave, cabeçalho, grupo, largura, formato
     ("d_em", "MSCI EM", "Change in weight (bps) and other flows", 9, "0.000"),
     ("p_other", "Other passive (US$ mn)", "Change in weight (bps) and other flows", 10, "#,##0.0"),
     ("series", "Price series (Prices tab)", "Lookup key", 11, None),
+    ("gics", "GICS sector (MSCI)", "Classification", 22, None),   # no fim: as notas leem as colunas por posição
 ]
 COLIDX = {k: i + 1 for i, (k, *_) in enumerate(COLS)}
 
@@ -479,6 +495,7 @@ def write_market_tab(wb, title: str, df: pd.DataFrame, aum_name: str, act_name: 
             "c_day": ret("DayAfterDate", "AnnDate", f"${L('control')}{rr}"),
             "c_ann": ret("LastDate", "AnnDate", f"${L('control')}{rr}"),
             "series": row.series,
+            "gics": row.gics,
         }
         for k_r, k_s, k_c in [("r_cut", "s_cut", "c_cut"), ("r_day", "s_day", "c_day"), ("r_ann", "s_ann", "c_ann")]:
             v[k_r] = (f'=IF(AND(ISNUMBER({L(k_s)}{rr}),ISNUMBER({L(k_c)}{rr})),'
@@ -490,7 +507,7 @@ def write_market_tab(wb, title: str, df: pd.DataFrame, aum_name: str, act_name: 
                 c.font = Font(name="Roboto", size=9, bold=True, color=NAVY)
             if fmt:
                 c.number_format = fmt
-            c.alignment = Alignment(horizontal="left" if k in ("ticker", "name", "sector", "change", "series")
+            c.alignment = Alignment(horizontal="left" if k in ("ticker", "name", "sector", "change", "series", "gics")
                                     else "center" if k == "control" else "right")
             if i % 2 == 1:
                 c.fill = FILL_ZEBRA
@@ -510,7 +527,7 @@ def write_market_tab(wb, title: str, df: pd.DataFrame, aum_name: str, act_name: 
         c = ws.cell(last_r + 2 + i, 1, n)
         c.font = F_NOTE
     ws.freeze_panes = ws.cell(R0, 3)
-    ws.auto_filter.ref = f"A{HR}:{L('series')}{last_r}"
+    ws.auto_filter.ref = f"A{HR}:{L('gics')}{last_r}"
     ws.sheet_view.zoomScale = 100
     ws.row_dimensions[3].height = 14
     ws.page_setup.orientation = "landscape"
@@ -518,6 +535,72 @@ def write_market_tab(wb, title: str, df: pd.DataFrame, aum_name: str, act_name: 
     ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.print_title_rows = f"{GR}:{HR}"
+    return ws
+
+
+def write_sectors(wb, markets: list[tuple[str, pd.DataFrame]]):
+    """Aba Sectors: entrada, saída e líquido por setor GICS, por SUMIFS sobre as abas dos mercados (recalcula
+    com as entradas da Basis). A ordem dos setores e a lista de membros saem do fluxo calculado na montagem."""
+    ws = wb.create_sheet("Sectors")
+    ws.sheet_view.showGridLines = False
+    ws.sheet_properties.tabColor = NAVY
+    ws["A1"] = "Flows by GICS sector: MSCI Brazil and MSCI Mexico"
+    ws["A1"].font = F_TITLE
+    ws["A2"] = ("US$ mn at 20-Oct-2026 prices, passive + active. Inflow = sum of the names with net buying in the "
+                "sector; outflow = sum of the names with net selling. Figures recalculate from the market tabs.")
+    ws["A2"].font = F_SUB
+    heads = ["GICS sector", "Names", "Inflow", "Outflow", "Net", "Net: passive", "Net: active",
+             "Members (largest flow first)"]
+    for j, w in enumerate([26, 8, 11, 11, 11, 12, 12, 70], start=1):
+        ws.column_dimensions[get_column_letter(j)].width = w
+    r = 4
+    for tab, df in markets:
+        n = len(df)
+        rng = {k: f"'{tab}'!${L(k)}$11:${L(k)}${10 + n}" for k in ("gics", "tt", "pt", "pa")}
+        ws.cell(r, 1, tab).font = F_TITLE
+        r += 1
+        for j, h in enumerate(heads, start=1):
+            c = ws.cell(r, j, h)
+            c.font, c.fill, c.border = F_HEAD, FILL_HEAD, B_HEAD
+            c.alignment = Alignment(horizontal="left" if j in (1, 8) else "center", vertical="center")
+        r0 = r + 1
+        order = df.groupby("gics")["_tt"].sum().sort_values()
+        for i, sec in enumerate(order.index):
+            rr = r0 + i
+            members = df[df["gics"] == sec].sort_values("_tt", key=abs, ascending=False)["ticker"]
+            vals = [sec, f"=COUNTIF({rng['gics']},$A{rr})",
+                    f'=SUMIFS({rng["tt"]},{rng["gics"]},$A{rr},{rng["tt"]},">0")',
+                    f'=SUMIFS({rng["tt"]},{rng["gics"]},$A{rr},{rng["tt"]},"<0")',
+                    f"=SUMIFS({rng['tt']},{rng['gics']},$A{rr})",
+                    f"=SUMIFS({rng['pt']},{rng['gics']},$A{rr})",
+                    f"=SUMIFS({rng['pa']},{rng['gics']},$A{rr})",
+                    ", ".join(members)]
+            for j, v in enumerate(vals, start=1):
+                c = ws.cell(rr, j, v)
+                c.font = F_BOLD if j == 1 else F_BODY
+                if 3 <= j <= 7:
+                    c.number_format = "#,##0.0"
+                c.alignment = Alignment(horizontal="left" if j in (1, 8) else "right")
+                if i % 2 == 1:
+                    c.fill = FILL_ZEBRA
+        rt = r0 + len(order)
+        ws.cell(rt, 1, "Total").font = F_BOLD
+        for j in range(2, 8):
+            col = get_column_letter(j)
+            c = ws.cell(rt, j, f"=SUM({col}{r0}:{col}{rt - 1})")
+            c.font, c.number_format = F_BOLD, "#,##0" if j == 2 else "#,##0.0"
+            c.alignment = Alignment(horizontal="right")
+        for j in range(1, 9):
+            ws.cell(rt, j).border = B_TOP
+        ws.conditional_formatting.add(f"C{r0}:G{rt}", CellIsRule(operator="lessThan", formula=["0"],
+                                                                 font=Font(color=RED)))
+        r = rt + 3
+    ws.cell(r - 1, 1, "Source: MSCI (GICS sector from the pro forma, first two digits of the GICS code), Lipper, "
+                      "XP Research. Flows are XP Research estimates.").font = F_NOTE
+    ws.freeze_panes = "A4"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
     return ws
 
 
@@ -730,6 +813,8 @@ def write_basis(wb, last: date | None, aum: dict, aum_mx: float, aum_mx_src: str
         ("JBS", "Net of the whole migration, as published: exit from the Standard indices and from EM IMI and ACWI ex "
                 "USA IMI funds, minus purchases by MSCI USA Small Cap, USA IMI and World Small Cap funds "
                 "(passive -302 mn; total -453 mn)."),
+        ("Sectors", "GICS sector from the MSCI pro forma (first two digits of the GICS code; current code for JBS, "
+                    "which leaves the index). The Sectors tab adds up each market's total flow by sector."),
         ("ADTV", "3-month (63 sessions to 11-Nov-2026) average daily traded value in US$ mn: Economatica for B3, "
                  "Yahoo consolidated volume for US-listed names, LSEG/Yahoo for Mexico."),
         ("Returns", "Brazil: total return (Yahoo close adjusted for dividends) against B3 sector indices, which are "
@@ -827,7 +912,8 @@ def main():
     for df, a_pas, a_act in ((bz, aum["Brazil"][1], act["BR"]), (mx, aum_mx, act_mx)):
         act_flow = ACTIVE_PART * (df["delta_bps"] * a_act + df["d_la"] * act["LATAM"]
                                   + df["d_em"] * (act["EM"] + w_acwi * act["ACWI"])) / 1e4
-        df["_imp"] = ((df["delta_bps"] / 1e4 * a_pas + df["p_regional"] + act_flow) / df["adtv"]).abs()
+        df["_tt"] = df["delta_bps"] / 1e4 * a_pas + df["p_regional"] + act_flow   # fluxo total (passivo + ativo)
+        df["_imp"] = (df["_tt"] / df["adtv"]).abs()
     bz = bz.sort_values("_imp", ascending=False)
     mx = mx.sort_values("_imp", ascending=False)
 
@@ -849,6 +935,7 @@ def main():
         "No additions or deletions; FIF changes in GFINBURO, PINFRA and GMEXICOB",
         notes_common + ["Country-fund flows: passive funds benchmarked to MSCI Mexico (Lipper, plus the iShares "
                         "MSCI Mexico Capped UCITS ETF); see Basis. Control group: MEXBOL (S&P/BMV IPC)."])
+    write_sectors(wb, [("MSCI Brazil", bz), ("MSCI Mexico", mx)])
     if a.bbg:
         series = bbg_series(bz, mx)
         write_prices_bbg(wb, series)
