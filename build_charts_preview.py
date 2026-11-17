@@ -145,6 +145,32 @@ LIPPER_MX = ROOT.parent / "recebido_1611" / "lipper_mexico_v3" / "MSCI_Mexico_AU
 EXTRA_MX = {"iShares MSCI Mexico Capped UCITS ETF": ("CMX1.L", 116.476)}  # US$ mi, Yahoo totalAssets 16/11
 
 
+# Base ativa da Lipper por grupo (nov26/fundos_aum_lipper.py, TNA de set-out/26, US$ bi) e participação calibrada
+LIPPER_GROUPS = ROOT.parent / "nov26" / "_data" / "base_fundos_lipper_2026-10.csv"
+ACTIVE_PART = 0.306  # mediana de 14 entradas/saídas do MSCI Brazil, fev/25-ago/26 (nov26/calibra_ativo.py)
+ACTIVE_PART_IQR = (0.135, 0.389)
+
+
+def aum_active(aum: dict) -> dict:
+    """Patrimônio ativo (US$ mi) dos fundos com benchmark MSCI que não replicam o índice, por grupo. Fundos ex China
+    e ex USA vão para o índice cheio pelo mesmo fator implícito no passivo da Base_Fundos (peso da China no EM e
+    dos EUA no ACWI)."""
+    t = pd.read_csv(LIPPER_GROUPS, sep=";").set_index("grupo").fillna(0) * 1e3
+    f_ch = (aum["EM"][1] - t.at["EM Standard", "Passivo"]) / t.at["EM ex China", "Passivo"]
+    f_us = (aum["ACWI"][1] - t.at["ACWI Standard", "Passivo"]) / t.at["ACWI ex USA", "Passivo"]
+    assert abs(t.at["BR Standard", "Passivo"] - aum["Brazil"][1]) < 1 and abs(t.at["LatAm", "Passivo"] - aum["Latam"][1]) < 1
+    return {"BR": t.at["BR Standard", "Ativo"], "LATAM": t.at["LatAm", "Ativo"],
+            "EM": t.at["EM Standard", "Ativo"] + f_ch * t.at["EM ex China", "Ativo"],
+            "ACWI": t.at["ACWI Standard", "Ativo"] + f_us * t.at["ACWI ex USA", "Ativo"]}
+
+
+def active_mexico() -> float:
+    d = pd.read_excel(LIPPER_MX, header=0, skiprows=[1])
+    tna = pd.to_numeric(d["Fund TNA (Mil) (US Dollar).1"], errors="coerce")
+    vivo = tna.gt(0) & pd.to_datetime(d["Fund TNA (Mil) (US Dollar)"], errors="coerce").ge("2026-06-01")
+    return float(tna[vivo & d["Management Approach"].eq("Active")].sum())
+
+
 def aum_mexico() -> tuple[float, str]:
     """Passivo que segue o MSCI Mexico: export da Lipper (FSCREEN, benchmark contém 'MSCI Mexico', qualquer
     asset universe) + os fundos que a tela não trouxe. Mesmo critério do fundos_aum_lipper.py: Index Tracking
@@ -349,6 +375,7 @@ COLS = [  # chave, cabeçalho, grupo, largura, formato
     ("pc", "Passive: country funds", "Estimated flows (US$ mn)", 10, "#,##0.0"),
     ("pr", "Passive: regional & global funds", "Estimated flows (US$ mn)", 11, "#,##0.0"),
     ("pt", "Passive total", "Estimated flows (US$ mn)", 9.5, "#,##0.0"),
+    ("pa", "Active funds", "Estimated flows (US$ mn)", 9, "#,##0.0"),
     ("tt", "Total (passive + active)", "Estimated flows (US$ mn)", 10, "#,##0.0"),
     ("ip", "Passive", "Impact (days of ADTV)", 8, "0.00"),
     ("it", "Total", "Impact (days of ADTV)", 8, "0.00"),
@@ -374,7 +401,8 @@ def L(key: str) -> str:
     return get_column_letter(COLIDX[key])
 
 
-def write_market_tab(wb, title: str, df: pd.DataFrame, aum_name: str, subtitle: str, notes: list[str]):
+def write_market_tab(wb, title: str, df: pd.DataFrame, aum_name: str, act_name: str, subtitle: str,
+                     notes: list[str]):
     ws = wb.create_sheet(title)
     ws.sheet_view.showGridLines = False
     ws.sheet_properties.tabColor = NAVY
@@ -438,7 +466,9 @@ def write_market_tab(wb, title: str, df: pd.DataFrame, aum_name: str, subtitle: 
                    f"+{L('p_other')}{rr}"),
             "d_la": float(row.d_la), "d_em": float(row.d_em), "p_other": float(row.p_other),
             "pt": f"={L('pc')}{rr}+{L('pr')}{rr}",
-            "tt": f"={L('pt')}{rr}*(1+ActiveRatio)",
+            "pa": (f"=ActivePart*({L('dw')}{rr}*{act_name}+{L('d_la')}{rr}*ACT_LATAM"
+                   f"+{L('d_em')}{rr}*(ACT_EM+EM_IN_ACWI*ACT_ACWI))/10000"),
+            "tt": f"={L('pt')}{rr}+{L('pa')}{rr}",
             "ip": f"={L('pt')}{rr}/{L('adtv')}{rr}",
             "it": f"={L('tt')}{rr}/{L('adtv')}{rr}",
             "s_cut": ret("LastDate", "CutoffDate", f"${L('series')}{rr}"),
@@ -468,7 +498,7 @@ def write_market_tab(wb, title: str, df: pd.DataFrame, aum_name: str, subtitle: 
     last_r = R0 + len(df) - 1
 
     # negativos em vermelho XP
-    for k in ("dw", "pc", "pr", "pt", "tt", "ip", "it", "s_cut", "s_day", "s_ann", "c_cut", "c_day", "c_ann",
+    for k in ("dw", "pc", "pr", "pt", "pa", "tt", "ip", "it", "s_cut", "s_day", "s_ann", "c_cut", "c_day", "c_ann",
               "r_cut", "r_day", "r_ann", "d_la", "d_em", "p_other"):
         rng = f"{L(k)}{R0}:{L(k)}{last_r}"
         ws.conditional_formatting.add(rng, CellIsRule(operator="lessThan", formula=["0"], font=Font(color=RED)))
@@ -579,7 +609,7 @@ def write_prices_bbg(wb, series: list[tuple[str, str, str, str]]):
 
 
 def write_basis(wb, last: date | None, aum: dict, aum_mx: float, aum_mx_src: str, n_br: int, n_mx: int,
-                bbg: bool = False):
+                act: dict, act_mx: float, bbg: bool = False):
     ws = wb.create_sheet("Basis")
     ws.sheet_view.showGridLines = False
     ws.column_dimensions["A"].width = 40
@@ -630,20 +660,42 @@ def write_basis(wb, last: date | None, aum: dict, aum_mx: float, aum_mx_src: str
          "Lipper, passive funds benchmarked to MSCI ACWI (flows report of 11-Nov-2026)"),
         ("EM weight in the ACWI", em_in_acwi(), "EM_IN_ACWI",
          "A stock's change in weight in the ACWI = its change in the EM x this weight"),
-        ("Active flows as a multiple of passive", 0.5, "ActiveRatio",
-         "House convention: total = passive x 1.5 (calibrated on implementation-day volume, Feb/25 to Aug/26)"),
+        ("MSCI Brazil active AUM (US$ mn)", act["BR"], "ACT_BR",
+         "Lipper, active funds (not index tracking) benchmarked to MSCI Brazil, TNA Sep-Oct 2026"),
+        ("MSCI Mexico active AUM (US$ mn)", act_mx, "ACT_MX",
+         "Lipper, active funds benchmarked to MSCI Mexico (mostly Mexico Fund Inc), TNA of 31-Oct-2026"),
+        ("MSCI EM Latin America active AUM (US$ mn)", act["LATAM"], "ACT_LATAM",
+         "Lipper, active funds benchmarked to MSCI EM Latin America"),
+        ("MSCI EM active AUM (US$ mn)", act["EM"], "ACT_EM",
+         "Lipper, active funds benchmarked to MSCI EM Standard (ex-China benchmarks scaled to the full index)"),
+        ("MSCI ACWI active AUM (US$ mn)", act["ACWI"], "ACT_ACWI",
+         "Lipper, active funds benchmarked to MSCI ACWI (ex-USA benchmarks scaled to the full index)"),
+        ("Share of active AUM that trades the change", ACTIVE_PART, "ActivePart",
+         f"Active funds don't replicate the index, so only part of them trades the change at the close. Median of "
+         f"14 MSCI Brazil additions and deletions, Feb/25 to Aug/26: (implementation-day extra volume - passive "
+         f"flow) / (change in weight x active AUM). Interquartile range {ACTIVE_PART_IQR[0]:.1%} to "
+         f"{ACTIVE_PART_IQR[1]:.1%}"),
     ]
     for i, (lab, val, nm, note) in enumerate(params):
         r = r0 + 1 + i
         ws.cell(r, 1, lab).font = F_BOLD
         c = ws.cell(r, 2, val)
-        c.number_format = "#,##0.0" if val > 5 else "0.00%" if nm == "EM_IN_ACWI" else "0.00"
+        c.number_format = "#,##0.0" if val > 5 else "0.00%" if nm == "EM_IN_ACWI" else "0.0%"
         c.font, c.fill = F_BOLD, FILL_INPUT
         ws.cell(r, 3, nm).font = F_NOTE
         ws.cell(r, 4, note).font = F_BODY
         ws.cell(r, 4).alignment = Alignment(wrap_text=True, vertical="top")
         wb.defined_names[nm] = DefinedName(nm, attr_text=f"Basis!$B${r}")
     r = r0 + len(params)
+    # razão implícita ativo / passivo (bruto), só para leitura
+    for i, (tab, n) in enumerate((("MSCI Brazil", n_br), ("MSCI Mexico", n_mx))):
+        r += 1
+        a_rng = f"'{tab}'!${L('pa')}$11:${L('pa')}${10 + n}"
+        p_rng = f"'{tab}'!${L('pt')}$11:${L('pt')}${10 + n}"
+        ws.cell(r, 1, f"Implied active / passive, gross ({tab.split()[1]})").font = F_BOLD
+        c = ws.cell(r, 2, f"=SUMPRODUCT(ABS({a_rng}))/SUMPRODUCT(ABS({p_rng}))")
+        c.number_format, c.font = '0.00"x"', F_BOLD
+        ws.cell(r, 4, "Output, not an input: active flows over passive flows, both in absolute value").font = F_BODY
 
     r1 = r + 2
     head(r1, ["Control groups", "B3 / Yahoo code", "Bloomberg ticker", "Used for"])
@@ -667,7 +719,9 @@ def write_basis(wb, last: date | None, aum: dict, aum_mx: float, aum_mx_src: str
         ("Flows", "Each group of passive funds trades the change in the stock's weight in its own index: country "
                   "funds = change in weight in MSCI Brazil/Mexico x country AUM; regional & global = change in weight "
                   "in MSCI EM Latin America x LatAm AUM + change in weight in MSCI EM x (EM AUM + EM weight in ACWI x "
-                  "ACWI AUM). Total = passive x (1 + active multiple). Impact = flow / 3M ADTV."),
+                  "ACWI AUM). Active funds with the same benchmarks trade the same changes in weight, times the share "
+                  "of active AUM that trades at the close (ActivePart). JBS's IMI and small cap migration (other "
+                  "passive) has no active leg. Total = passive + active. Impact = flow / 3M ADTV."),
         ("vs. the report", "The flows report of 11-Nov-2026 scaled the regional and global funds by the country's weight "
                            "(as if they reinvested in the country what they sell of a deleted name). Here they reinvest "
                            "across their whole index, as they do. Names with index events barely change (JBS, AXIA3, "
@@ -769,9 +823,12 @@ def main():
     w_acwi = em_in_acwi()
     for df in (bz, mx):
         df["p_regional"] = (df["d_la"] * aum["Latam"][1] + df["d_em"] * (aum["EM"][1] + w_acwi * aum["ACWI"][1])) / 1e4             + df["p_other"]
-    bz["_imp"] = ((bz["delta_bps"] / 1e4 * aum["Brazil"][1] + bz["p_regional"]) * 1.5 / bz["adtv"]).abs()
+    act, act_mx = aum_active(aum), active_mexico()
+    for df, a_pas, a_act in ((bz, aum["Brazil"][1], act["BR"]), (mx, aum_mx, act_mx)):
+        act_flow = ACTIVE_PART * (df["delta_bps"] * a_act + df["d_la"] * act["LATAM"]
+                                  + df["d_em"] * (act["EM"] + w_acwi * act["ACWI"])) / 1e4
+        df["_imp"] = ((df["delta_bps"] / 1e4 * a_pas + df["p_regional"] + act_flow) / df["adtv"]).abs()
     bz = bz.sort_values("_imp", ascending=False)
-    mx["_imp"] = ((mx["delta_bps"] / 1e4 * aum_mx + mx["p_regional"]) * 1.5 / mx["adtv"]).abs()
     mx = mx.sort_values("_imp", ascending=False)
 
     wb = Workbook()
@@ -781,13 +838,13 @@ def main():
         "XP Research estimates; negative = outflow. Relative return in percentage points.",
     ]
     write_market_tab(
-        wb, "MSCI Brazil", bz, "AUM_BR",
+        wb, "MSCI Brazil", bz, "AUM_BR", "ACT_BR",
         "Announced 11-Nov-2026 | effective 1-Dec-2026, traded at the close of 30-Nov-2026 | "
         "No additions; JBS deleted (reclassified as a US company)",
         notes_common + ["NU, XP, AUGO and JBS: returns from the B3 BDRs (ROXO34, XPBR31, AURA33, JBSS32). "
                         "Control group codes on the Basis tab."])
     write_market_tab(
-        wb, "MSCI Mexico", mx, "AUM_MX",
+        wb, "MSCI Mexico", mx, "AUM_MX", "ACT_MX",
         "Announced 11-Nov-2026 | effective 1-Dec-2026, traded at the close of 30-Nov-2026 | "
         "No additions or deletions; FIF changes in GFINBURO, PINFRA and GMEXICOB",
         notes_common + ["Country-fund flows: passive funds benchmarked to MSCI Mexico (Lipper, plus the iShares "
@@ -795,7 +852,7 @@ def main():
     if a.bbg:
         series = bbg_series(bz, mx)
         write_prices_bbg(wb, series)
-        write_basis(wb, None, aum, aum_mx, aum_mx_src, len(bz), len(mx), bbg=True)
+        write_basis(wb, None, aum, aum_mx, aum_mx_src, len(bz), len(mx), act, act_mx, bbg=True)
         wb.active = 0
         wb.calculation.fullCalcOnLoad = True
         out = OUT.with_name("Charts_Preview_BBG.xlsx")
@@ -803,7 +860,7 @@ def main():
         print(f"ok: {out} | {len(series)} séries Bloomberg | BR {len(bz)} | MX {len(mx)}")
         return
     write_prices(wb, px, filled, meta)
-    write_basis(wb, last, aum, aum_mx, aum_mx_src, len(bz), len(mx))
+    write_basis(wb, last, aum, aum_mx, aum_mx_src, len(bz), len(mx), act, act_mx)
     wb.active = 0
     wb.save(OUT)
     recalc_with_excel(OUT)
