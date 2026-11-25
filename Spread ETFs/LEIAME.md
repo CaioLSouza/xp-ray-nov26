@@ -82,6 +82,7 @@ Cada período tem o seu nome de arquivo, então uma rodada mensal não sobrescre
 - Vai um mês calendário por chamada. Se a resposta vier cortada pelo limite de linhas, o mês é dividido sozinho.
 - Os meses fechados ficam em `cache\`. Rodar de novo só baixa o que falta (`usar_cache = S`).
   - O cache é separado por lista de campos: ao trocar um campo, aquele mês é baixado de novo.
+  - Mês que voltou vazio não entra no cache: na rodada seguinte ele é pedido de novo (o vazio pode ter sido RIC errado ou falta de permissão).
 - A API devolve em UTC, e o CSV sai no horário de Brasília.
 
 ## Tratamento (só o pedido)
@@ -92,11 +93,12 @@ Cada período tem o seu nome de arquivo, então uma rodada mensal não sobrescre
 - **Filtros:** nenhum. Livro cruzado, oferta zerada e valores estranhos vão como vieram.
 
 ## Pontos a confirmar na primeira rodada
-- **Campos de quantidade e último preço:** se `BIDSIZE`, `ASKSIZE` ou `TRDPRC_1` vierem vazios, o relatório avisa. Confira o nome no Data Item Browser (DIB) e troque na aba Parametros.
+- **Campos de quantidade:** na 1ª rodada real (25/11/2026), `BIDSIZE` e `ASKSIZE` vieram vazios em todos os ETFs na barra de 5 minutos. A suspeita é que a barra resumida da LSEG não traga quantidade, só o tick. O `diagnostico_ric.py` testa as duas coisas.
+- **ETFs de renda fixa e caixa:** na mesma rodada, os 15 voltaram sem nenhuma barra. Agora o relatório mostra a mensagem da API (RIC não encontrado, sem permissão etc.).
 - **Carimbo de hora:** ver se o da barra marca o início ou o fim dos 5 minutos (documentação da LSEG).
 - **Campo diário de spread médio:** se existe um pronto, só como referência. O script não verifica; buscar "spread" no DIB e ler a definição.
 
 ## Se der erro
 - **"A resposta não trouxe ['BID', 'ASK']"**: a mensagem lista as colunas que vieram.
-- **ETF com 0 barras em todos os meses**: conferir o RIC no Workspace (ex.: `BOVA11.SA`).
+- **ETF com 0 barras em todos os meses**: ler no relatório o que a API respondeu e conferir o RIC no Workspace (ex.: `BOVA11.SA`). Para investigar um ETF: `python diagnostico_ric.py LFTS11` (grava `diagnostico_ric.txt`).
 - **Erro de permissão ao gravar**: o CSV ou o Excel está aberto no Excel; feche e rode de novo, porque o cache já baixado fica.
