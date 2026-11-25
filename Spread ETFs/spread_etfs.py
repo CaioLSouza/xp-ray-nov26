@@ -1,21 +1,26 @@
 """
-Barras intraday de BID e ASK (e, opcionalmente, último preço) de ETFs da B3, pela LSEG (Refinitiv Workspace),
-no formato pedido pelo Research (2026-11-25). Gera também um Excel à parte com o spread calculado.
+Barras intraday de BID, ASK, quantidade no topo do livro (BIDSIZE, ASKSIZE) e último preço (TRDPRC_1) de ETFs
+da B3, pela LSEG (Refinitiv Workspace), no formato pedido pelo Research (versão de 2026-11-25, 2ª rodada).
+Gera também um Excel à parte com o spread calculado.
 
 Uso (no PC com o Workspace aberto e logado):
-    python spread_etfs.py                       # lê inputs_spread_etfs.xlsx na mesma pasta
-    python spread_etfs.py outra_planilha.xlsx   # ou outra planilha de entrada
+    python spread_etfs.py                       # lê inputs_spread_etfs.xlsx (período da aba Parametros)
+    python spread_etfs.py --mes-anterior        # rotina mensal: só o mês calendário anterior
+    python spread_etfs.py outra_planilha.xlsx   # outra planilha de entrada (combina com --mes-anterior)
+    python spread_etfs.py saida\\<bruto>.csv     # refaz só o Excel do spread, sem chamar a API
 
 O que faz:
   1. Lê os ETFs e os parâmetros na planilha de entrada.
-  2. Para cada ETF, baixa as barras (padrão: 5 minutos) de BID, ASK e TRDPRC_1, um mês por chamada.
+  2. Para cada ETF, baixa as barras (padrão: 5 minutos) dos campos da aba Parametros, um mês por chamada.
      Usa o último valor de cada barra, como a API devolve. Se a resposta vier cortada pelo limite de
      linhas, divide o mês sozinho. Os meses já fechados ficam em cache.
   3. Converte o horário de UTC para Brasília e monta, para cada pregão, uma linha a cada 5 minutos de
-     10:15 a 16:45 (inclusive), sem buracos. Barra que falta repete o último valor do MESMO dia (nunca do
-     dia anterior). Não filtra mais nada: livro cruzado, oferta zerada etc. vão como vieram.
-  4. Grava saida\\<arquivo>.csv (data_hora, ticker, compra, venda, ultimo) e um relatorio_*.txt com o que
-     foi pedido para mandar junto: desde quando há histórico, campos e intervalo usados na chamada.
+     10:15 a 16:45 (inclusive), sem buracos. Barra sem atualização repete o último valor do MESMO dia (nunca
+     do dia anterior); se o dia ainda não tinha oferta, a linha fica vazia (nunca zero). Não filtra mais nada.
+  4. Grava saida\\etfs_bid_ask_5min_AAAAMMDD_AAAAMMDD.csv
+     (data_hora, ticker, compra, venda, qtd_compra, qtd_venda, ultimo) e um relatorio_*.txt com a data de
+     execução, os campos usados na chamada, desde quando há histórico e as falhas (ETF sem dado, dia faltando,
+     campo vazio).
 
 Requer: pip install lseg-data pandas openpyxl   (ou a biblioteca antiga refinitiv-data)
 App key: variável de ambiente LSEG_APP_KEY (gerada no App Key Generator do Workspace),
@@ -34,7 +39,11 @@ import pandas as pd
 
 PASTA = Path(__file__).resolve().parent
 TZ = "America/Sao_Paulo"
-CAMPO_BID, CAMPO_ASK, CAMPO_ULTIMO = "BID", "ASK", "TRDPRC_1"
+# coluna do CSV -> campo da API (padrão; a aba Parametros pode trocar o nome do campo)
+CAMPOS_PADRAO = {"compra": "BID", "venda": "ASK", "qtd_compra": "BIDSIZE", "qtd_venda": "ASKSIZE",
+                 "ultimo": "TRDPRC_1"}
+COLUNAS = list(CAMPOS_PADRAO)          # ordem das colunas de valor no CSV
+COLS_QTD = ("qtd_compra", "qtd_venda")  # saem como inteiro (cotas)
 LOG: list[str] = []
 
 
@@ -62,7 +71,13 @@ def _hora(v) -> dt.time:
     return dt.datetime.strptime(str(v).strip()[:5], "%H:%M").time()
 
 
-def ler_entrada(caminho: Path):
+def mes_anterior(hoje: pd.Timestamp | None = None):
+    hoje = (hoje or pd.Timestamp.today()).normalize()
+    fim = hoje.replace(day=1) - pd.Timedelta(days=1)
+    return fim.replace(day=1), fim
+
+
+def ler_entrada(caminho: Path, forcar_mes_anterior: bool = False):
     xls = pd.ExcelFile(caminho)
 
     etfs = pd.read_excel(xls, "ETFs", dtype=str).fillna("")
@@ -87,26 +102,34 @@ def ler_entrada(caminho: Path):
         return padrao if v is None or (isinstance(v, float) and np.isnan(v)) or str(v).strip() == "" else v
 
     ontem = pd.Timestamp.today().normalize() - pd.Timedelta(days=1)
+    periodo = str(p("periodo", "datas")).strip().lower().replace(" ", "_").replace("ê", "e")
+    mensal = forcar_mes_anterior or periodo in ("mes_anterior", "mensal")
     cfg = {
         "data_inicio": pd.Timestamp(p("data_inicio", ontem - pd.Timedelta(days=365))).normalize(),
         "data_fim": pd.Timestamp(p("data_fim", ontem)).normalize(),
+        "mensal": mensal,
         "intervalo_min": int(p("intervalo_min", 5)),
         "janela_inicio": _hora(p("janela_inicio", "10:15")),
         "janela_fim": _hora(p("janela_fim", "16:45")),
         "abertura_continuo": _hora(p("abertura_continuo", "10:00")),
-        "incluir_ultimo": _sim(p("incluir_ultimo", "S")),
+        "campos": {col: str(p(f"campo_{col}", api)).strip().upper() for col, api in CAMPOS_PADRAO.items()},
         "gerar_spread": _sim(p("gerar_spread", "S")),
         "min_barras_validas": int(p("min_barras_validas", 20)),
-        "sondar_historico": _sim(p("sondar_historico", "S")),
+        "sondar_historico": _sim(p("sondar_historico", "S")) and not mensal,
         "pausa_seg": float(p("pausa_seg", 0.5)),
         "usar_cache": _sim(p("usar_cache", "S")),
         "pasta_saida": str(p("pasta_saida", "saida")),
         "arquivo_saida": str(p("arquivo_saida", "")).strip(),
     }
+    if mensal:
+        cfg["data_inicio"], cfg["data_fim"] = mes_anterior()
+        cfg["arquivo_saida"] = ""  # o nome sai do mês, para uma rodada não sobrescrever a outra
     if cfg["data_fim"] < cfg["data_inicio"]:
         raise SystemExit("data_fim antes de data_inicio na aba Parametros.")
     if not cfg["abertura_continuo"] <= cfg["janela_inicio"] < cfg["janela_fim"]:
         raise SystemExit("Na aba Parametros, a ordem tem de ser abertura_continuo <= janela_inicio < janela_fim.")
+    if len(set(cfg["campos"].values())) != len(cfg["campos"]):
+        raise SystemExit(f"Há campo repetido na aba Parametros: {cfg['campos']}")
     cfg["intervalo_api"] = f"{cfg['intervalo_min']}min"
     return etfs, cfg
 
@@ -134,24 +157,28 @@ def abrir_sessao(ld):
     log("Sessão LSEG aberta.")
 
 
-def _vazio() -> pd.DataFrame:
-    return pd.DataFrame({c: pd.Series(dtype=float) for c in (CAMPO_BID, CAMPO_ASK, CAMPO_ULTIMO)},
-                        index=pd.DatetimeIndex([], tz="UTC"))
+def _vazio(campos) -> pd.DataFrame:
+    return pd.DataFrame({c: pd.Series(dtype=float) for c in campos}, index=pd.DatetimeIndex([], tz="UTC"))
 
 
-def _normalizar(df: pd.DataFrame | None) -> pd.DataFrame:
+def _normalizar(df: pd.DataFrame | None, campos) -> pd.DataFrame:
+    """Põe a resposta da API no formato fixo: índice em UTC e uma coluna por campo (vazia se não veio).
+
+    Os dois primeiros campos (compra e venda) são obrigatórios: se não vierem, para com erro.
+    """
     if df is None or len(df) == 0:
-        return _vazio()
+        return _vazio(campos)
     df = df.copy()
     if isinstance(df.columns, pd.MultiIndex):  # alguns retornos vêm com (RIC, campo)
         df.columns = [c[-1] for c in df.columns]
     df.columns = [str(c).upper() for c in df.columns]
-    faltando = [c for c in (CAMPO_BID, CAMPO_ASK) if c not in df.columns]
+    faltando = [c for c in campos[:2] if c not in df.columns]
     if faltando:
         raise RuntimeError(f"A resposta não trouxe {faltando}. Colunas recebidas: {list(df.columns)}")
-    if CAMPO_ULTIMO not in df.columns:
-        df[CAMPO_ULTIMO] = np.nan
-    df = df[[CAMPO_BID, CAMPO_ASK, CAMPO_ULTIMO]].apply(pd.to_numeric, errors="coerce")
+    for c in campos:
+        if c not in df.columns:
+            df[c] = np.nan
+    df = df[list(campos)].apply(pd.to_numeric, errors="coerce")
     idx = pd.to_datetime(df.index)
     idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")  # a LSEG devolve em UTC
     df.index = idx
@@ -162,22 +189,22 @@ def chamar_api(ld, ric, campos, intervalo, ini_utc, fim_utc, pausa) -> pd.DataFr
     for tentativa in range(1, 4):
         try:
             df = ld.get_history(
-                universe=ric, fields=campos, interval=intervalo,
+                universe=ric, fields=list(campos), interval=intervalo,
                 start=ini_utc.strftime("%Y-%m-%dT%H:%M:%S"), end=fim_utc.strftime("%Y-%m-%dT%H:%M:%S"),
             )
             time.sleep(pausa)
-            return _normalizar(df)
+            return _normalizar(df, campos)
         except RuntimeError:
             raise
         except Exception as e:  # noqa: BLE001
             texto = str(e).lower()
             if "no data" in texto or "not found" in texto or "empty" in texto:
                 time.sleep(pausa)
-                return _vazio()
+                return _vazio(campos)
             espera = 5 * tentativa
             log(f"   erro na API ({ric}, {ini_utc:%Y-%m-%d}): {e}. Nova tentativa em {espera}s.")
             time.sleep(espera)
-    raise RuntimeError(f"Falhou 3 vezes: {ric} {ini_utc} → {fim_utc}")
+    raise RuntimeError(f"a API falhou 3 vezes ({ric}, {ini_utc:%d/%m/%Y} a {fim_utc:%d/%m/%Y})")
 
 
 def _parece_cortado(df, ini_utc, fim_utc) -> bool:
@@ -228,8 +255,8 @@ def meses(ini: pd.Timestamp, fim_incl: pd.Timestamp):
         a = b
 
 
-def campos_da_chamada(cfg):
-    return [CAMPO_BID, CAMPO_ASK] + ([CAMPO_ULTIMO] if cfg["incluir_ultimo"] else [])
+def campos_da_chamada(cfg) -> list[str]:
+    return [cfg["campos"][c] for c in COLUNAS]
 
 
 def baixar_periodo(ld, ric, cfg) -> pd.DataFrame:
@@ -241,8 +268,8 @@ def baixar_periodo(ld, ric, cfg) -> pd.DataFrame:
     for a, b in meses(cfg["data_inicio"], cfg["data_fim"]):
         arq = cache_dir / f"{ric.replace('.', '_')}_{cfg['intervalo_api']}_{'+'.join(campos)}_{a:%Y%m%d}_{b:%Y%m%d}.csv"
         if cfg["usar_cache"] and arq.exists() and b <= hoje:
-            df = pd.read_csv(arq, index_col=0)
-            df.index = pd.to_datetime(df.index, utc=True)
+            # passa pelo mesmo formato da API: um mês vazio no cache volta como texto e estragaria a concatenação
+            df = _normalizar(pd.read_csv(arq, index_col=0), campos)
         else:
             df = baixar(ld, ric, campos, cfg["intervalo_api"],
                         a.tz_localize(TZ).tz_convert("UTC"), b.tz_localize(TZ).tz_convert("UTC"), cfg["pausa_seg"])
@@ -250,7 +277,7 @@ def baixar_periodo(ld, ric, cfg) -> pd.DataFrame:
                 df.to_csv(arq)
         log(f"   {ric} {a:%d/%m/%Y} a {b - pd.Timedelta(days=1):%d/%m/%Y}: {len(df)} barras")
         partes.append(df)
-    out = pd.concat(partes) if partes else _vazio()
+    out = pd.concat(partes) if partes else _vazio(campos)
     return out[~out.index.duplicated(keep="last")].sort_index()
 
 
@@ -261,7 +288,8 @@ def sondar_inicio(ld, ric, cfg, primeira_no_periodo):
     if primeira_no_periodo.tz_convert(TZ).date() > (cfg["data_inicio"] + pd.Timedelta(days=7)).date():
         return primeira_no_periodo, "o histórico começa dentro do período pedido"
     if not cfg["sondar_historico"]:
-        return None, "existe pelo menos desde o início do período (sondagem desligada)"
+        return None, ("rotina mensal, sem sondagem" if cfg["mensal"]
+                      else "existe pelo menos desde o início do período (sondagem desligada)")
     campos = campos_da_chamada(cfg)
     primeira = primeira_no_periodo
     fim = cfg["data_inicio"]
@@ -279,17 +307,22 @@ def sondar_inicio(ld, ric, cfg, primeira_no_periodo):
 # --------------------------------------------------------------------------------------------
 # Tratamento
 # --------------------------------------------------------------------------------------------
+def _grade_vazia() -> pd.DataFrame:
+    d = {"data_hora": pd.Series(dtype="datetime64[ns]"), "ticker": pd.Series(dtype=str)}
+    d.update({c: pd.Series(dtype=float) for c in COLUNAS})
+    return pd.DataFrame(d)
+
+
 def montar_grade(df_utc: pd.DataFrame, ticker: str, cfg) -> pd.DataFrame:
     """Uma linha a cada N minutos, de janela_inicio a janela_fim (inclusive), por pregão com dado.
 
-    A barra que falta repete o último valor do mesmo dia. As barras do próprio dia entre a abertura do
-    pregão contínuo e o início da janela servem de ponto de partida; as do leilão de abertura, não.
-    Nada é filtrado.
+    Barra sem atualização repete o último valor do mesmo dia, campo a campo. As barras do próprio dia entre a
+    abertura do pregão contínuo e o início da janela servem de ponto de partida; as do leilão de abertura, não.
+    Antes da primeira oferta do dia a linha fica vazia (nunca zero). Nada é filtrado.
     """
     if df_utc.empty:
-        return pd.DataFrame({"data_hora": pd.Series(dtype="datetime64[ns]"), "ticker": pd.Series(dtype=str),
-                             "compra": pd.Series(dtype=float), "venda": pd.Series(dtype=float),
-                             "ultimo": pd.Series(dtype=float)})
+        return _grade_vazia()
+    nomes = {api: col for col, api in cfg["campos"].items()}
     loc = df_utc.tz_convert(TZ).tz_localize(None)
     passo = pd.Timedelta(minutes=cfg["intervalo_min"])
     partes = []
@@ -302,11 +335,36 @@ def montar_grade(df_utc: pd.DataFrame, ticker: str, cfg) -> pd.DataFrame:
             continue  # nenhuma barra no pregão: dia sem negociação (feriado, por exemplo)
         grade = pd.date_range(t0, t1, freq=passo)
         r = g.reindex(g.index.union(grade)).ffill().reindex(grade)  # ffill só dentro do dia
-        r = r.rename(columns={CAMPO_BID: "compra", CAMPO_ASK: "venda", CAMPO_ULTIMO: "ultimo"})
+        r = r.rename(columns=nomes)[COLUNAS]
         r.insert(0, "ticker", ticker)
         r.index.name = "data_hora"
         partes.append(r.reset_index())
-    return pd.concat(partes, ignore_index=True) if partes else montar_grade(_vazio(), ticker, cfg)
+    return pd.concat(partes, ignore_index=True) if partes else _grade_vazia()
+
+
+def dias_faltando(tabelas: dict[str, pd.DataFrame], cfg):
+    """Dias faltando por ETF e dias úteis sem dado em nenhum ETF.
+
+    O calendário de pregões é o conjunto dos dias em que pelo menos um ETF teve dado. Um ETF "perde" o dia quando
+    o dia está nesse calendário, cai depois do primeiro pregão dele no período e ele não teve barra na janela.
+    """
+    dias = {t: set(x["data_hora"].dt.date) for t, x in tabelas.items()}
+    calendario = set().union(*dias.values()) if dias else set()
+    # antes do 1º pregão com dado é "antes do histórico" (seção 2 do relatório), não falha nem feriado
+    uteis = {d.date() for d in pd.bdate_range(min(calendario), cfg["data_fim"])} if calendario else set()
+    sem_nenhum = sorted(uteis - calendario)
+    por_etf = {}
+    for t, ds in dias.items():
+        if ds:
+            falta = sorted(d for d in calendario if d >= min(ds) and d not in ds)
+            if falta:
+                por_etf[t] = falta
+    return por_etf, sem_nenhum
+
+
+def _datas(lista, n=12) -> str:
+    txt = ", ".join(f"{d:%d/%m/%Y}" for d in lista[:n])
+    return txt + (f" e mais {len(lista) - n}" if len(lista) > n else "")
 
 
 # --------------------------------------------------------------------------------------------
@@ -320,39 +378,63 @@ def versao_biblioteca(ld) -> str:
     return getattr(ld, "__name__", "?")
 
 
+def gravar_csv(base: pd.DataFrame, arq: Path) -> None:
+    """CSV UTF-8, vírgula, ponto decimal, sem índice; preço com 2 casas, quantidade inteira, vazio = vazio."""
+    x = base[["data_hora", "ticker"] + COLUNAS].copy()
+    x["data_hora"] = x["data_hora"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    for c in COLUNAS:
+        x[c] = pd.to_numeric(x[c], errors="coerce").astype(float)
+    for c in COLS_QTD:
+        x[c] = x[c].round().astype("Int64")
+    x.to_csv(arq, index=False, sep=",", decimal=".", encoding="utf-8", float_format="%.2f")
+
+
 def main():
-    args = sys.argv[1:]
+    args = [a for a in sys.argv[1:]]
+    forcar_mensal = any(a.lower() in ("--mes-anterior", "--mensal") for a in args)
+    args = [a for a in args if not a.startswith("--")]
     if args and args[0].lower().endswith(".csv"):  # python spread_etfs.py saida\<bruto>.csv [planilha.xlsx]
         so_spread(Path(args[0]), Path(args[1]) if len(args) > 1 else PASTA / "inputs_spread_etfs.xlsx")
         return
     entrada = Path(args[0]) if args else PASTA / "inputs_spread_etfs.xlsx"
-    etfs, cfg = ler_entrada(entrada)
-    log(f"{len(etfs)} ETFs: {', '.join(etfs['ticker'])} | {cfg['data_inicio']:%d/%m/%Y} a {cfg['data_fim']:%d/%m/%Y} "
-        f"| barras de {cfg['intervalo_min']} min | {cfg['janela_inicio']:%H:%M} a {cfg['janela_fim']:%H:%M}")
+    etfs, cfg = ler_entrada(entrada, forcar_mensal)
+    executado = dt.datetime.now()
+    log(f"{len(etfs)} ETFs: {', '.join(etfs['ticker'])}")
+    log(f"Período {cfg['data_inicio']:%d/%m/%Y} a {cfg['data_fim']:%d/%m/%Y}"
+        f"{' (rotina mensal: mês anterior)' if cfg['mensal'] else ''} | barras de {cfg['intervalo_min']} min | "
+        f"{cfg['janela_inicio']:%H:%M} a {cfg['janela_fim']:%H:%M} | campos {campos_da_chamada(cfg)}")
 
     ld = importar_api()
     abrir_sessao(ld)
-    tabelas, resumo = [], []
+    tabelas, resumo = {}, []
     try:
         for etf in etfs.itertuples():
             log(f"{etf.ticker} ({etf.ric})")
-            bruto = baixar_periodo(ld, etf.ric, cfg)
-            primeira = bruto.index.min() if len(bruto) else None
-            inicio_hist, como = sondar_inicio(ld, etf.ric, cfg, primeira)
-            t = montar_grade(bruto, etf.ticker, cfg)
-            tabelas.append(t)
-            sem_valor = int(t[["compra", "venda"]].isna().any(axis=1).sum()) if len(t) else 0
-            resumo.append({
-                "ticker": etf.ticker, "ric": etf.ric,
+            item = {"ticker": etf.ticker, "ric": etf.ric, "erro": "", "primeira_barra_periodo": "-",
+                    "historico_desde": "-", "como": "", "pregoes": 0, "linhas": 0,
+                    "linhas_sem_compra_ou_venda": 0, "campos_vazios": []}
+            try:
+                bruto = baixar_periodo(ld, etf.ric, cfg)
+                primeira = bruto.index.min() if len(bruto) else None
+                inicio_hist, como = sondar_inicio(ld, etf.ric, cfg, primeira)
+                t = montar_grade(bruto, etf.ticker, cfg)
+            except Exception as e:  # noqa: BLE001  (um ETF com erro não derruba os outros)
+                item["erro"] = str(e)
+                log(f"   ERRO em {etf.ticker}: {e}")
+                resumo.append(item)
+                continue
+            tabelas[etf.ticker] = t
+            item.update({
                 "primeira_barra_periodo": primeira.tz_convert(TZ).strftime("%d/%m/%Y %H:%M") if primeira is not None else "-",
                 "historico_desde": inicio_hist.tz_convert(TZ).strftime("%d/%m/%Y") if inicio_hist is not None else "-",
                 "como": como,
                 "pregoes": t["data_hora"].dt.date.nunique() if len(t) else 0,
                 "linhas": len(t),
-                "linhas_sem_compra_ou_venda": sem_valor,
-                "ultimo_vazio": bool(len(t)) and bool(t["ultimo"].isna().all()),
+                "linhas_sem_compra_ou_venda": int(t[["compra", "venda"]].isna().any(axis=1).sum()) if len(t) else 0,
+                "campos_vazios": [c for c in COLUNAS[2:] if len(t) and t[c].isna().all()],
             })
-            log(f"   {etf.ticker}: {resumo[-1]['pregoes']} pregões, {len(t)} linhas; histórico desde {resumo[-1]['historico_desde']}")
+            resumo.append(item)
+            log(f"   {etf.ticker}: {item['pregoes']} pregões, {len(t)} linhas; histórico desde {item['historico_desde']}")
     finally:
         try:
             ld.close_session()
@@ -363,21 +445,20 @@ def main():
     saida.mkdir(exist_ok=True)
     nome = cfg["arquivo_saida"] or f"etfs_bid_ask_{cfg['intervalo_min']}min_{cfg['data_inicio']:%Y%m%d}_{cfg['data_fim']:%Y%m%d}"
     nome = nome[:-4] if nome.lower().endswith(".csv") else nome
-    base = pd.concat(tabelas, ignore_index=True)
-    if not cfg["incluir_ultimo"]:
-        base = base.drop(columns="ultimo")
-    bruto_csv = base.copy()
-    bruto_csv["data_hora"] = bruto_csv["data_hora"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    base = pd.concat(list(tabelas.values()), ignore_index=True) if tabelas else _grade_vazia()
     arq_csv = saida / f"{nome}.csv"
-    bruto_csv.to_csv(arq_csv, index=False, sep=",", decimal=".", encoding="utf-8", float_format="%.2f")
+    gravar_csv(base, arq_csv)
     log(f"Pronto: {arq_csv}")
     arq_spread = None
     if cfg["gerar_spread"] and len(base):
         arq_spread = gravar_spread(base, list(etfs["ticker"]), cfg, saida / f"spread_{nome}.xlsx")
         log(f"Spread calculado: {arq_spread}")
+    faltas = dias_faltando(tabelas, cfg)
     arq_txt = saida / f"relatorio_{nome}.txt"
     log(f"Relatório: {arq_txt}")
-    arq_txt.write_text(relatorio(cfg, resumo, ld, arq_csv, arq_spread), encoding="utf-8")
+    texto, n_falhas = relatorio(cfg, resumo, faltas, ld, arq_csv, arq_spread, executado)
+    arq_txt.write_text(texto, encoding="utf-8")
+    log(f"{n_falhas} falha(s) registrada(s) no relatório." if n_falhas else "Sem falhas.")
 
 
 def so_spread(arq_csv: Path, entrada: Path):
@@ -393,9 +474,11 @@ def so_spread(arq_csv: Path, entrada: Path):
 # Spread calculado (arquivo à parte; o CSV bruto não muda)
 # --------------------------------------------------------------------------------------------
 def calcular_spread(base: pd.DataFrame, min_validos: int):
-    """A partir do CSV bruto (data_hora, ticker, compra, venda): spread de cada barra e agregados.
+    """A partir do CSV bruto (data_hora, ticker, compra, venda[, qtd_compra, qtd_venda]): spread de cada barra
+    e agregados por pregão.
 
     Barra válida: compra > 0, venda > 0 e venda > compra. As outras ficam fora da conta (no bruto, não).
+    Profundidade no topo = média das quantidades na melhor compra e na melhor venda, nas barras válidas.
     """
     b = base.copy()
     b["data_hora"] = pd.to_datetime(b["data_hora"])
@@ -405,25 +488,34 @@ def calcular_spread(base: pd.DataFrame, min_validos: int):
     meio = (b["compra"] + b["venda"]) / 2
     b["spread_bps"] = ((b["venda"] - b["compra"]) / meio * 1e4).where(valido)
     b["spread_rs"] = (b["venda"] - b["compra"]).where(valido)
+    tem_qtd = all(c in b.columns for c in COLS_QTD) and b[list(COLS_QTD)].notna().any().all()
+    if tem_qtd:
+        b["prof_cotas"] = ((b["qtd_compra"] + b["qtd_venda"]) / 2).where(valido)
+        b["prof_rs_mil"] = ((b["qtd_compra"] * b["compra"] + b["qtd_venda"] * b["venda"]) / 2 / 1e3).where(valido)
+    else:
+        b["prof_cotas"] = np.nan
+        b["prof_rs_mil"] = np.nan
     b["valido"] = valido
 
     g = b.groupby(["ticker", "data"])
     d = g.agg(barras=("valido", "size"), barras_validas=("valido", "sum"),
               spread_medio_bps=("spread_bps", "mean"), spread_mediano_bps=("spread_bps", "median"),
               spread_min_bps=("spread_bps", "min"), spread_max_bps=("spread_bps", "max"),
-              spread_medio_rs=("spread_rs", "mean")).reset_index()
+              spread_medio_rs=("spread_rs", "mean"), prof_cotas=("prof_cotas", "mean"),
+              prof_rs_mil=("prof_rs_mil", "mean")).reset_index()
     d["spread_p90_bps"] = g["spread_bps"].quantile(0.9).values
     d["pct_barras_validas"] = d["barras_validas"] / d["barras"]
     pouco = d["barras_validas"] < min_validos
-    for c in ("spread_medio_bps", "spread_mediano_bps", "spread_min_bps", "spread_max_bps", "spread_p90_bps", "spread_medio_rs"):
+    for c in ("spread_medio_bps", "spread_mediano_bps", "spread_min_bps", "spread_max_bps", "spread_p90_bps",
+              "spread_medio_rs", "prof_cotas", "prof_rs_mil"):
         d.loc[pouco, c] = np.nan
     d = d[["ticker", "data", "barras", "barras_validas", "pct_barras_validas", "spread_medio_bps", "spread_mediano_bps",
-           "spread_p90_bps", "spread_min_bps", "spread_max_bps", "spread_medio_rs"]]
-    return b, d
+           "spread_p90_bps", "spread_min_bps", "spread_max_bps", "spread_medio_rs", "prof_cotas", "prof_rs_mil"]]
+    return b, d, tem_qtd
 
 
 def gravar_spread(base: pd.DataFrame, ordem: list[str], cfg, arq: Path) -> Path:
-    b, d = calcular_spread(base, cfg["min_barras_validas"])
+    b, d, tem_qtd = calcular_spread(base, cfg["min_barras_validas"])
     ordem = [t for t in ordem if t in set(d["ticker"])]
     ok = d[d["spread_medio_bps"].notna()]
 
@@ -434,7 +526,7 @@ def gravar_spread(base: pd.DataFrame, ordem: list[str], cfg, arq: Path) -> Path:
     for t in ordem:
         x = ok[ok["ticker"] == t].set_index("data")
         todos = d[d["ticker"] == t]
-        linhas.append({
+        linha = {
             "ETF": t,
             "Pregões": len(x),
             "Spread médio (bps)": x["spread_medio_bps"].mean(),
@@ -443,10 +535,16 @@ def gravar_spread(base: pd.DataFrame, ordem: list[str], cfg, arq: Path) -> Path:
             "P10 dos dias (bps)": x["spread_medio_bps"].quantile(0.1),
             "P90 dos dias (bps)": x["spread_medio_bps"].quantile(0.9),
             "Spread médio (R$)": x["spread_medio_rs"].mean(),
+        }
+        if tem_qtd:
+            linha["Profundidade média no topo (cotas)"] = x["prof_cotas"].mean()
+            linha["Profundidade média no topo (R$ mil)"] = x["prof_rs_mil"].mean()
+        linha.update({
             "% das barras com cotação válida": todos["barras_validas"].sum() / todos["barras"].sum() if len(todos) else np.nan,
             "Primeiro pregão": x.index.min(),
             "Último pregão": x.index.max(),
         })
+        linhas.append(linha)
     resumo = pd.DataFrame(linhas)
 
     diario = ok.pivot_table(index="data", columns="ticker", values="spread_medio_bps").reindex(columns=ordem)
@@ -462,11 +560,14 @@ def gravar_spread(base: pd.DataFrame, ordem: list[str], cfg, arq: Path) -> Path:
         "ticker": "ETF", "data": "Data", "barras": "Barras", "barras_validas": "Barras válidas",
         "pct_barras_validas": "% válidas", "spread_medio_bps": "Spread médio (bps)",
         "spread_mediano_bps": "Mediana (bps)", "spread_p90_bps": "P90 (bps)", "spread_min_bps": "Mínimo (bps)",
-        "spread_max_bps": "Máximo (bps)", "spread_medio_rs": "Spread médio (R$)"})
+        "spread_max_bps": "Máximo (bps)", "spread_medio_rs": "Spread médio (R$)",
+        "prof_cotas": "Profundidade no topo (cotas)", "prof_rs_mil": "Profundidade no topo (R$ mil)"})
+    if not tem_qtd:
+        det = det.drop(columns=["Profundidade no topo (cotas)", "Profundidade no topo (R$ mil)"])
     det["ETF"] = pd.Categorical(det["ETF"], ordem, ordered=True)
     det = det.sort_values(["ETF", "Data"])
 
-    notas = pd.DataFrame({"Notas": [
+    notas = [
         "Spread de cada barra = (venda - compra) / ponto médio x 10.000, em bps, com a cotação do fim da barra "
         f"de {cfg['intervalo_min']} minutos, de {cfg['janela_inicio']:%H:%M} a {cfg['janela_fim']:%H:%M}.",
         "Barra válida: compra > 0, venda > 0 e venda > compra. Livro cruzado/travado, oferta zerada ou vazia ficam "
@@ -477,9 +578,12 @@ def gravar_spread(base: pd.DataFrame, ordem: list[str], cfg, arq: Path) -> Path:
         "Perfil intradiário: média do spread de cada horário, em todos os pregões do período.",
         "A amostra a cada 5 minutos aproxima a média ponderada pelo tempo; não pega spreads que abrem e fecham "
         "dentro da barra.",
-        "Fonte: LSEG Workspace (BID/ASK). Dado bruto da LSEG: não redistribuir.",
-        f"Gerado em {dt.datetime.now():%d/%m/%Y %H:%M}.",
-    ]})
+    ]
+    if tem_qtd:
+        notas.append("Profundidade no topo: média de (qtd_compra + qtd_venda) / 2 nas barras válidas, em cotas; "
+                     "em R$ mil, cada lado vezes o seu preço.")
+    notas += ["Fonte: LSEG Workspace. Dado bruto da LSEG: não redistribuir.",
+              f"Gerado em {dt.datetime.now():%d/%m/%Y %H:%M}."]
 
     with pd.ExcelWriter(arq, engine="openpyxl") as w:
         resumo.to_excel(w, sheet_name="Resumo", index=False)
@@ -487,7 +591,7 @@ def gravar_spread(base: pd.DataFrame, ordem: list[str], cfg, arq: Path) -> Path:
         diario.reset_index().to_excel(w, sheet_name="Diário (bps)", index=False)
         perfil.reset_index().to_excel(w, sheet_name="Perfil intradiário (bps)", index=False)
         det.to_excel(w, sheet_name="Diário detalhado", index=False)
-        notas.to_excel(w, sheet_name="Notas", index=False)
+        pd.DataFrame({"Notas": notas}).to_excel(w, sheet_name="Notas", index=False)
         _formatar_spread(w)
     return arq
 
@@ -520,6 +624,8 @@ def _formatar_spread(w) -> None:
                 elif isinstance(c.value, (int, float)) or c.value is None:
                     if "%" in nome:
                         c.number_format = "0.0%"
+                    elif "cotas" in nome or "R$ mil" in nome:
+                        c.number_format = "#,##0"
                     elif "R$" in nome:
                         c.number_format = "0.000"
                     elif "Pregões" in nome or "Barras" in nome:
@@ -543,48 +649,79 @@ def _formatar_spread(w) -> None:
                     mid_color="FFEB84", end_type="max", end_color="F8696B"))
 
 
-def relatorio(cfg, resumo, ld, arq_csv, arq_spread=None) -> str:
-    r = pd.DataFrame(resumo)
-    campos = campos_da_chamada(cfg)
+def relatorio(cfg, resumo, faltas, ld, arq_csv, arq_spread, executado):
+    por_etf, sem_nenhum = faltas
+    campos = cfg["campos"]
+
+    falhas = []
+    for x in resumo:
+        if x["erro"]:
+            falhas.append(f"{x['ticker']} ({x['ric']}): erro na chamada, ETF fora do arquivo. {x['erro']}")
+        elif x["pregoes"] == 0:
+            falhas.append(f"{x['ticker']} ({x['ric']}): sem nenhum dado no período. Conferir o RIC.")
+        for c in x["campos_vazios"]:
+            falhas.append(f"{x['ticker']}: o campo {campos[c]} (coluna {c}) veio vazio no período todo. "
+                          "Conferir o nome do campo no Data Item Browser (DIB).")
+    for t, dias in por_etf.items():
+        falhas.append(f"{t}: {len(dias)} pregão(ões) sem dado, em que outros ETFs tiveram: {_datas(dias)}")
+
     linhas = [
         "Barras intraday de ETFs (LSEG Workspace)",
-        f"Gerado em {dt.datetime.now():%d/%m/%Y %H:%M}. Arquivo bruto: {arq_csv.name}"
-        + (f"; spread calculado: {arq_spread.name}" if arq_spread else ""),
+        f"Data de execução: {executado:%d/%m/%Y %H:%M}",
+        f"Período: {cfg['data_inicio']:%d/%m/%Y} a {cfg['data_fim']:%d/%m/%Y}"
+        + (" (rotina mensal: mês anterior)" if cfg["mensal"] else ""),
+        f"Arquivo: {arq_csv.name}" + (f"; spread calculado: {arq_spread.name}" if arq_spread else ""),
         "",
-        "1. Desde quando o histórico intradiário existe",
+        "0. Falhas",
     ]
-    for x in resumo:
-        linhas.append(f"   {x['ticker']}: {x['historico_desde']} ({x['como']}); primeira barra no período pedido: "
-                      f"{x['primeira_barra_periodo']}")
+    linhas += [f"   - {f}" for f in falhas] or ["   Nenhuma."]
+    if sem_nenhum:
+        linhas.append(f"   Dias úteis sem dado em nenhum ETF (provável feriado da B3; se não for, é falha): {_datas(sem_nenhum, 30)}")
     linhas += [
-        f"   Período pedido: {cfg['data_inicio']:%d/%m/%Y} a {cfg['data_fim']:%d/%m/%Y}.",
         "",
-        "2. Chamada usada",
+        "1. Campos usados na chamada (coluna do CSV = campo da API)",
+    ]
+    linhas += [f"   {c} = {campos[c]}" for c in COLUNAS]
+    linhas += [
         f"   Biblioteca: {versao_biblioteca(ld)}, função get_history.",
         f"   universe = <RIC> (ex.: {resumo[0]['ric'] if resumo else 'BOVA11.SA'})",
-        f"   fields = {campos}" + ("   (TRDPRC_1 = último preço)" if cfg["incluir_ultimo"] else ""),
+        f"   fields = {campos_da_chamada(cfg)}",
         f"   interval = \"{cfg['intervalo_api']}\"",
         "   start/end = um mês calendário por chamada, em UTC (o mês é dividido se a resposta vier cortada).",
         "   Valor de cada barra: o último do intervalo, como a API devolve.",
-        "   Horário: a API devolve em UTC; o CSV está no horário de Brasília.",
+        "",
+        "2. Desde quando o histórico intradiário existe",
+    ]
+    for x in resumo:
+        if x["erro"]:
+            linhas.append(f"   {x['ticker']}: - (erro na chamada)")
+        else:
+            linhas.append(f"   {x['ticker']}: {x['historico_desde']} ({x['como']}); primeira barra no período: "
+                          f"{x['primeira_barra_periodo']}")
+    linhas += [
         "",
         "3. Tratamento",
+        "   Horário: a API devolve em UTC; o CSV está no horário de Brasília.",
         f"   Uma linha a cada {cfg['intervalo_min']} minutos, de {cfg['janela_inicio']:%H:%M} a {cfg['janela_fim']:%H:%M} "
-        "(inclusive), só nos pregões com dado.",
-        "   Barra que falta: repete o último valor do mesmo dia, nunca do dia anterior. Barras do próprio dia entre",
-        f"   {cfg['abertura_continuo']:%H:%M} e {cfg['janela_inicio']:%H:%M} servem de ponto de partida; as do leilão de "
-        "abertura, não.",
-        "   Se o dia ainda não tinha nenhuma cotação até aquele horário, a linha fica com compra/venda vazios.",
+        "(inclusive), para cada ETF, só nos pregões com dado.",
+        "   Barra sem atualização: repete o último valor do mesmo dia, campo a campo, nunca do dia anterior. Barras do",
+        f"   próprio dia entre {cfg['abertura_continuo']:%H:%M} e {cfg['janela_inicio']:%H:%M} servem de ponto de partida; "
+        "as do leilão de abertura, não.",
+        "   Se o dia ainda não tinha oferta até aquele horário, a linha fica vazia (nunca zero).",
         "   Carimbo de hora: o da barra como a API devolve. Confirmar na documentação da LSEG se ele marca o",
         "   início ou o fim do intervalo (muda em 5 minutos a leitura de cada linha).",
         "   Nenhum outro filtro (livro cruzado, oferta zerada etc. vão como vieram).",
+        "   CSV: UTF-8, vírgula como separador, ponto decimal, sem coluna de índice; preços com 2 casas e",
+        "   quantidades (cotas) inteiras.",
         "",
         "4. Linhas por ETF",
     ]
     for x in resumo:
-        linhas.append(f"   {x['ticker']}: {x['pregoes']} pregões, {x['linhas']} linhas, "
-                      f"{x['linhas_sem_compra_ou_venda']} linhas sem compra ou venda"
-                      + ("; último preço veio vazio" if cfg["incluir_ultimo"] and x["ultimo_vazio"] else ""))
+        if x["erro"]:
+            linhas.append(f"   {x['ticker']}: erro, fora do arquivo")
+        else:
+            linhas.append(f"   {x['ticker']}: {x['pregoes']} pregões, {x['linhas']} linhas, "
+                          f"{x['linhas_sem_compra_ou_venda']} linhas sem compra ou venda")
     linhas += [
         "",
         "5. Campo diário pronto de spread médio",
@@ -593,9 +730,7 @@ def relatorio(cfg, resumo, ld, arq_csv, arq_spread=None) -> str:
         "",
         "Log da rodada:",
     ] + [f"   {l}" for l in LOG]
-    if len(r) and (r["pregoes"] == 0).any():
-        linhas.insert(4, "   ATENÇÃO: ETF sem nenhum dado no período. Confira o RIC.")
-    return "\n".join(linhas) + "\n"
+    return "\n".join(linhas) + "\n", len(falhas)
 
 
 if __name__ == "__main__":
