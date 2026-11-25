@@ -43,7 +43,7 @@ def tenta(titulo, f):
 
 def main():
     tickers = [a.upper().replace(".SA", "") for a in sys.argv[1:]] or \
-        ["BOVA11", "LFTS11", "NCDI11", "LTBX11", "AUPO11", "SELI11"]
+        ["BOVA11", "LFTS11", "NCDI11", "LTBX11"]
     try:
         import lseg.data as ld
     except ImportError:
@@ -67,6 +67,16 @@ def main():
                 universe=ric, interval="5min", start=ini.strftime(fmt), end=fim.strftime(fmt)))
             tenta("5min, só BID e ASK", lambda: ld.get_history(
                 universe=ric, fields=["BID", "ASK"], interval="5min", start=ini.strftime(fmt), end=fim.strftime(fmt)))
+            # as quantidades (BIDSIZE/ASKSIZE) vieram vazias na barra de 5 min: elas existem no tick?
+            u = fim - pd.Timedelta(days=1)
+            tenta("tick, 1 hora de ontem, BID/ASK/BIDSIZE/ASKSIZE", lambda: ld.get_history(
+                universe=ric, fields=["BID", "ASK", "BIDSIZE", "ASKSIZE"], interval="tick",
+                start=(u + pd.Timedelta(hours=14)).strftime(fmt), end=(u + pd.Timedelta(hours=15)).strftime(fmt)))
+            for dias_atras in (60, 100, 200, 365):  # até onde vai o histórico de tick
+                v = fim - pd.Timedelta(days=dias_atras)
+                tenta(f"tick, {dias_atras} dias atrás (1 dia inteiro), BID/BIDSIZE", lambda v=v: ld.get_history(
+                    universe=ric, fields=["BID", "BIDSIZE"], interval="tick",
+                    start=v.strftime(fmt), end=(v + pd.Timedelta(days=1)).strftime(fmt), count=10))
             tenta("diário, BID/ASK/TRDPRC_1", lambda: ld.get_history(
                 universe=ric, fields=["BID", "ASK", "TRDPRC_1"], interval="daily",
                 start=(fim - pd.Timedelta(days=30)).strftime(fmt), end=fim.strftime(fmt)))
