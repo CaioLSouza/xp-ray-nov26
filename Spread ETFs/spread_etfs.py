@@ -185,6 +185,9 @@ def _normalizar(df: pd.DataFrame | None, campos) -> pd.DataFrame:
     return df[~df.index.isna()].sort_index()
 
 
+RESPOSTAS_VAZIAS: dict[str, str] = {}  # RIC -> o que a API disse quando não devolveu dado (vai para o relatório)
+
+
 def chamar_api(ld, ric, campos, intervalo, ini_utc, fim_utc, pausa) -> pd.DataFrame:
     for tentativa in range(1, 4):
         try:
@@ -199,6 +202,12 @@ def chamar_api(ld, ric, campos, intervalo, ini_utc, fim_utc, pausa) -> pd.DataFr
         except Exception as e:  # noqa: BLE001
             texto = str(e).lower()
             if "no data" in texto or "not found" in texto or "empty" in texto:
+                # não é falha de conexão: a API respondeu que não tem dado. Guarda a mensagem, que diz o porquê
+                # (RIC inválido, sem permissão, campo inexistente...)
+                msg = " ".join(str(e).split())[:400]
+                if RESPOSTAS_VAZIAS.get(ric) != msg:
+                    log(f"   a API não devolveu dado ({ric}, {ini_utc:%Y-%m-%d}): {msg}")
+                RESPOSTAS_VAZIAS[ric] = msg
                 time.sleep(pausa)
                 return _vazio(campos)
             espera = 5 * tentativa
@@ -267,13 +276,16 @@ def baixar_periodo(ld, ric, cfg) -> pd.DataFrame:
     partes = []
     for a, b in meses(cfg["data_inicio"], cfg["data_fim"]):
         arq = cache_dir / f"{ric.replace('.', '_')}_{cfg['intervalo_api']}_{'+'.join(campos)}_{a:%Y%m%d}_{b:%Y%m%d}.csv"
+        df = None
         if cfg["usar_cache"] and arq.exists() and b <= hoje:
             # passa pelo mesmo formato da API: um mês vazio no cache volta como texto e estragaria a concatenação
             df = _normalizar(pd.read_csv(arq, index_col=0), campos)
-        else:
+            if df.empty:  # mês vazio não vale como cache (pode ter sido RIC errado ou falta de permissão): baixa de novo
+                df = None
+        if df is None:
             df = baixar(ld, ric, campos, cfg["intervalo_api"],
                         a.tz_localize(TZ).tz_convert("UTC"), b.tz_localize(TZ).tz_convert("UTC"), cfg["pausa_seg"])
-            if b <= hoje:  # só guarda mês fechado
+            if b <= hoje and len(df):  # só guarda mês fechado e com dado
                 df.to_csv(arq)
         log(f"   {ric} {a:%d/%m/%Y} a {b - pd.Timedelta(days=1):%d/%m/%Y}: {len(df)} barras")
         partes.append(df)
@@ -658,7 +670,10 @@ def relatorio(cfg, resumo, faltas, ld, arq_csv, arq_spread, executado):
         if x["erro"]:
             falhas.append(f"{x['ticker']} ({x['ric']}): erro na chamada, ETF fora do arquivo. {x['erro']}")
         elif x["pregoes"] == 0:
-            falhas.append(f"{x['ticker']} ({x['ric']}): sem nenhum dado no período. Conferir o RIC.")
+            msg = RESPOSTAS_VAZIAS.get(x["ric"])
+            falhas.append(f"{x['ticker']} ({x['ric']}): sem nenhum dado no período. "
+                          + (f"A API respondeu: {msg.rstrip('.')}." if msg else "A API devolveu tabela vazia, sem mensagem.")
+                          + " Conferir o RIC e a permissão de intradiário na LSEG.")
         for c in x["campos_vazios"]:
             falhas.append(f"{x['ticker']}: o campo {campos[c]} (coluna {c}) veio vazio no período todo. "
                           "Conferir o nome do campo no Data Item Browser (DIB).")
