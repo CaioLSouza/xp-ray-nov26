@@ -12,7 +12,7 @@ Baixa as barras intraday dos ETFs listados na planilha e entrega um CSV bruto no
     - tamanho da barra (5 min);
     - janela do dia (10h15 a 16h45);
     - nome dos campos da API;
-    - opções.
+    - opções, entre elas `quantidade_tick` (S/N), que liga as quantidades pelo tick.
 - `spread_etfs.py`: o script.
 - `rodar.bat`: roda o período da planilha (primeira carga).
 - `rodar_mes_anterior.bat`: roda só o mês anterior (rotina mensal).
@@ -23,8 +23,11 @@ Baixa as barras intraday dos ETFs listados na planilha e entrega um CSV bruto no
 3. Abra e logue o Workspace.
 4. Rode o script:
    - **Primeira carga** (período da planilha, hoje de 25/11/2025 a 24/11/2026): `python spread_etfs.py` ou `rodar.bat`.
+     - As quantidades só saem para os últimos ~3 meses; nos meses mais antigos, `qtd_compra` e `qtd_venda` ficam vazias.
+     - O tick pesa: o BOVA11 tem de 13 a 33 mil eventos por hora de pregão, de 7 a 15 segundos por hora baixada. Conte com algo em torno de 1 minuto por pregão nos ETFs de ações mais líquidos, e bem menos nos de renda fixa. Com `quantidade_tick = N` a rodada fica só nas barras e é bem mais rápida.
    - **Todo mês** (só o mês calendário anterior): `python spread_etfs.py --mes-anterior` ou `rodar_mes_anterior.bat`. O mesmo vale com `periodo = mes_anterior` na planilha.
      - Em dezembro, por exemplo, ele baixa de 01/11 a 30/11. Os dias que já vieram na carga voltam de novo, e vale a versão nova.
+     - Rode até uns 2 meses depois do fim do mês: as quantidades vêm do tick, que a LSEG guarda por cerca de 3 meses.
      - Pode ir para o Agendador de Tarefas do Windows, desde que o Workspace esteja aberto e logado na hora.
    - Para usar outra planilha: `python spread_etfs.py outra.xlsx` (combina com `--mes-anterior`).
 
@@ -36,12 +39,12 @@ Baixa as barras intraday dos ETFs listados na planilha e entrega um CSV bruto no
 
 | coluna | exemplo | campo |
 |---|---|---|
-| data_hora | 2026-11-18 10:15:00 | horário de Brasília |
+| data_hora | 2026-11-18 10:15:00 | horário de Brasília, instante da foto (ver abaixo) |
 | ticker | BOVA11 | sem o .SA |
 | compra | 173.50 | BID |
 | venda | 173.52 | ASK |
-| qtd_compra | 5000 | BIDSIZE (cotas, inteiro) |
-| qtd_venda | 3200 | ASKSIZE (cotas, inteiro) |
+| qtd_compra | 5000 | BIDSIZE do tick (cotas, inteiro; só nos últimos ~3 meses) |
+| qtd_venda | 3200 | ASKSIZE do tick (cotas, inteiro; só nos últimos ~3 meses) |
 | ultimo | 173.51 | TRDPRC_1 (último preço) |
 
 Cada período tem o seu nome de arquivo, então uma rodada mensal não sobrescreve a carga nem a do mês anterior. Rodar de novo o mesmo período substitui os arquivos dele.
@@ -58,7 +61,7 @@ Cada período tem o seu nome de arquivo, então uma rodada mensal não sobrescre
 | Notas | método |
 
 - **Conta:** spread da barra = (venda − compra) / ponto médio × 10.000, em bps. Entram só as barras válidas (compra > 0, venda > 0 e venda > compra).
-- **Profundidade no topo:** média de (qtd_compra + qtd_venda) / 2 nas barras válidas. Em R$ mil, cada lado vezes o seu preço.
+- **Profundidade no topo:** média de (qtd_compra + qtd_venda) / 2 nas barras válidas. Em R$ mil, cada lado vezes o seu preço. Só entra nos pregões com quantidade (os últimos ~3 meses).
 - **Dia:** o spread do dia é a média das barras válidas. Pregão com menos de `min_barras_validas` barras válidas fica sem spread.
 - **Período:** o resumo e o mensal são a média simples dos dias.
 - **Refazer só o Excel**, sem chamar a API: `python spread_etfs.py saida\<arquivo bruto>.csv`.
@@ -69,11 +72,12 @@ Cada período tem o seu nome de arquivo, então uma rodada mensal não sobrescre
   - ETF com erro na chamada, que fica fora do arquivo, enquanto os outros seguem;
   - ETF sem nenhum dado (conferir o RIC);
   - campo que veio vazio no período todo (conferir o nome no DIB);
+  - pregão em que o tick falhou (quantidade vazia nesse dia) e ETF em que o preço do tick não bateu com o da barra;
   - pregão faltando num ETF quando outros ETFs tiveram dado no dia;
   - dias úteis sem dado em nenhum ETF (em geral, feriado da B3).
 - Os nomes exatos dos campos, da função e do intervalo usados na chamada.
 - Desde quando existe histórico intradiário, por ETF. Na primeira carga, se o período já começa com dado, o script volta mês a mês para descobrir a data. Na rotina mensal ele não sonda.
-- Linhas por ETF e o log da rodada.
+- Linhas por ETF, os pregões com quantidade do tick, quanto o preço do tick bateu com o da barra, e o log da rodada.
 
 ## Como a chamada é feita
 - `get_history(universe=<RIC>, fields=["BID", "ASK", "BIDSIZE", "ASKSIZE", "TRDPRC_1"], interval="5min", start, end)`. Cada barra traz o último valor do intervalo.
@@ -84,19 +88,28 @@ Cada período tem o seu nome de arquivo, então uma rodada mensal não sobrescre
   - O cache é separado por lista de campos: ao trocar um campo, aquele mês é baixado de novo.
   - Mês que voltou vazio não entra no cache: na rodada seguinte ele é pedido de novo (o vazio pode ter sido RIC errado ou falta de permissão).
 - A API devolve em UTC, e o CSV sai no horário de Brasília.
+- **Quantidades (tick a tick):** a barra de 5 minutos não traz `BIDSIZE`/`ASKSIZE`; só o tick traz.
+  - Com `quantidade_tick = S`, o script faz `get_history(universe=<RIC>, fields=["BID", "ASK", "BIDSIZE", "ASKSIZE"], interval="tick")`, uma hora por chamada, de 10:00 a 16:45 de cada pregão.
+  - Em cada linha, entra a quantidade do último evento antes do horário da linha, no mesmo pregão. É a mesma regra da barra, e o relatório confere: o preço do tick tem de bater com o da barra.
+  - A LSEG guarda o tick por cerca de 3 meses: em 26/11/2026 havia tick em 28/08/2026 e não em 29/07/2026. O script não pede pregão mais antigo que `tick_dias_max` (120 dias) e para de voltar depois de 3 pregões seguidos sem tick.
+  - Os pregões já lidos ficam em `cache\tick\`, só com as fotos de 5 em 5 minutos (arquivos pequenos).
 
 ## Tratamento (só o pedido)
 - **Janela:** 10:15 a 16:45, inclusive, uma linha a cada 5 minutos para cada ETF, só nos pregões com dado.
+- **Horário da linha = instante da foto.** A linha das 10:15 traz a última oferta antes das 10:15.
+  - A LSEG carimba a barra pelo início do intervalo: a barra 10:10 vai de 10:10 a 10:15 e traz a oferta do fim. Por isso o script soma 5 minutos ao carimbo.
+  - Conferido contra o tick em 26/11/2026: nas 12 barras do BOVA11 entre 11h e 12h, o valor da barra é o último tick antes do carimbo + 5 min, e nunca o último antes do carimbo.
 - **Barra sem atualização:** repete o último valor do mesmo dia, campo a campo, nunca do dia anterior.
   - As barras do próprio dia entre 10:00 e 10:15 servem de ponto de partida; as do leilão de abertura, não.
   - Se o dia ainda não tinha oferta até aquele horário, a linha fica vazia, nunca zero.
 - **Filtros:** nenhum. Livro cruzado, oferta zerada e valores estranhos vão como vieram.
 
-## Pontos a confirmar na primeira rodada
-- **Campos de quantidade:** na 1ª rodada real (25/11/2026), `BIDSIZE` e `ASKSIZE` vieram vazios em todos os ETFs na barra de 5 minutos. A suspeita é que a barra resumida da LSEG não traga quantidade, só o tick. O `diagnostico_ric.py` testa as duas coisas.
-- **ETFs de renda fixa e caixa:** na mesma rodada, os 15 voltaram sem nenhuma barra. O `diagnostico_ric.py` mostrou que o RIC deles é `<ticker>=SA`, e o script agora testa os dois formatos.
-- **Quantidades pelo tick:** o `diagnostico_tick.py` mede até onde vai o histórico tick a tick, quanto ele pesa e se o carimbo da barra marca o início ou o fim dos 5 minutos.
-- **Carimbo de hora:** ver se o da barra marca o início ou o fim dos 5 minutos (documentação da LSEG).
+## O que já foi conferido na LSEG (rodadas de 25 e 26/11/2026)
+- **ETFs de renda fixa e caixa:** voltaram sem nenhuma barra na 1ª rodada. O RIC deles é `<ticker>=SA`, e o script agora testa os dois formatos.
+- **Quantidades:** `BIDSIZE`/`ASKSIZE` não existem na barra de 5 minutos e existem no tick (o `diagnostico_ric.py` mostrou os campos da barra; o `diagnostico_tick.py` mediu o tick).
+- **Carimbo:** a barra é carimbada pelo início do intervalo (ver Tratamento).
+
+## Ponto em aberto
 - **Campo diário de spread médio:** se existe um pronto, só como referência. O script não verifica; buscar "spread" no DIB e ler a definição.
 
 ## Se der erro
