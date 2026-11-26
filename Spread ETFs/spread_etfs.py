@@ -14,10 +14,16 @@ O que faz:
   2. Para cada ETF, baixa as barras (padrão: 5 minutos) dos campos da aba Parametros, um mês por chamada.
      Usa o último valor de cada barra, como a API devolve. Se a resposta vier cortada pelo limite de
      linhas, divide o mês sozinho. Os meses já fechados ficam em cache.
-  3. Converte o horário de UTC para Brasília e monta, para cada pregão, uma linha a cada 5 minutos de
+     A LSEG carimba a barra pelo INÍCIO do intervalo (a barra 10:10 vai de 10:10 a 10:15 e traz a última
+     oferta antes das 10:15). O CSV usa o horário da foto: a linha das 10:15 é essa barra.
+  3. As quantidades no topo do livro (BIDSIZE/ASKSIZE) não existem na barra de 5 minutos, só no tick a tick.
+     Com quantidade_tick = S, o script baixa o tick de cada pregão (uma hora por chamada) e, em cada linha,
+     usa a quantidade do último evento antes do horário da linha, no mesmo pregão. A LSEG guarda o tick por
+     cerca de 3 meses; antes disso, qtd_compra e qtd_venda ficam vazias.
+  4. Converte o horário de UTC para Brasília e monta, para cada pregão, uma linha a cada 5 minutos de
      10:15 a 16:45 (inclusive), sem buracos. Barra sem atualização repete o último valor do MESMO dia (nunca
      do dia anterior); se o dia ainda não tinha oferta, a linha fica vazia (nunca zero). Não filtra mais nada.
-  4. Grava saida\\etfs_bid_ask_5min_AAAAMMDD_AAAAMMDD.csv
+  5. Grava saida\\etfs_bid_ask_5min_AAAAMMDD_AAAAMMDD.csv
      (data_hora, ticker, compra, venda, qtd_compra, qtd_venda, ultimo) e um relatorio_*.txt com a data de
      execução, os campos usados na chamada, desde quando há histórico e as falhas (ETF sem dado, dia faltando,
      campo vazio).
@@ -44,13 +50,15 @@ CAMPOS_PADRAO = {"compra": "BID", "venda": "ASK", "qtd_compra": "BIDSIZE", "qtd_
                  "ultimo": "TRDPRC_1"}
 COLUNAS = list(CAMPOS_PADRAO)          # ordem das colunas de valor no CSV
 COLS_QTD = ("qtd_compra", "qtd_venda")  # saem como inteiro (cotas)
+CAMPOS_TICK = ["BID", "ASK", "BIDSIZE", "ASKSIZE"]  # tick a tick: o único lugar com quantidade no topo do livro
 LOG: list[str] = []
 
 
-def log(msg: str) -> None:
+def log(msg: str, so_tela: bool = False) -> None:
     linha = f"{dt.datetime.now():%H:%M:%S}  {msg}"
     print(linha, flush=True)
-    LOG.append(linha)
+    if not so_tela:
+        LOG.append(linha)
 
 
 # --------------------------------------------------------------------------------------------
@@ -118,6 +126,9 @@ def ler_entrada(caminho: Path, forcar_mes_anterior: bool = False):
         "min_barras_validas": int(p("min_barras_validas", 20)),
         "sondar_historico": _sim(p("sondar_historico", "S")) and not mensal,
         "pausa_seg": float(p("pausa_seg", 0.5)),
+        "quantidade_tick": _sim(p("quantidade_tick", "S")),
+        "tick_dias_max": int(p("tick_dias_max", 120)),
+        "pausa_tick_seg": float(p("pausa_tick_seg", 0.1)),
         "usar_cache": _sim(p("usar_cache", "S")),
         "pasta_saida": str(p("pasta_saida", "saida")),
         "arquivo_saida": str(p("arquivo_saida", "")).strip(),
@@ -183,13 +194,16 @@ def _normalizar(df: pd.DataFrame | None, campos) -> pd.DataFrame:
     idx = pd.to_datetime(df.index)
     idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")  # a LSEG devolve em UTC
     df.index = idx
-    return df[~df.index.isna()].sort_index()
+    df = df[~df.index.isna()]
+    if len(df) > 1 and df.index.is_monotonic_decreasing and not df.index.is_monotonic_increasing:
+        df = df.iloc[::-1]  # veio do mais novo para o mais velho: inverte antes, para eventos no mesmo instante
+    return df.sort_index(kind="stable")  # ficarem na ordem em que aconteceram (importa no tick)
 
 
 RESPOSTAS_VAZIAS: dict[str, str] = {}  # RIC -> o que a API disse quando não devolveu dado (vai para o relatório)
 
 
-def chamar_api(ld, ric, campos, intervalo, ini_utc, fim_utc, pausa) -> pd.DataFrame:
+def chamar_api(ld, ric, campos, intervalo, ini_utc, fim_utc, pausa, anotar=True) -> pd.DataFrame:
     for tentativa in range(1, 4):
         try:
             df = ld.get_history(
@@ -206,9 +220,10 @@ def chamar_api(ld, ric, campos, intervalo, ini_utc, fim_utc, pausa) -> pd.DataFr
                 # não é falha de conexão: a API respondeu que não tem dado. Guarda a mensagem, que diz o porquê
                 # (RIC inválido, sem permissão, campo inexistente...)
                 msg = " ".join(str(e).split())[:400]
-                if RESPOSTAS_VAZIAS.get(ric) != msg:
-                    log(f"   a API não devolveu dado ({ric}, {ini_utc:%Y-%m-%d}): {msg}")
-                RESPOSTAS_VAZIAS[ric] = msg
+                if anotar:  # no tick, hora sem evento é normal: não vai para o log nem para o relatório
+                    if RESPOSTAS_VAZIAS.get(ric) != msg:
+                        log(f"   a API não devolveu dado ({ric}, {ini_utc:%Y-%m-%d}): {msg}")
+                    RESPOSTAS_VAZIAS[ric] = msg
                 time.sleep(pausa)
                 return _vazio(campos)
             espera = 5 * tentativa
@@ -346,6 +361,9 @@ def _grade_vazia() -> pd.DataFrame:
 def montar_grade(df_utc: pd.DataFrame, ticker: str, cfg) -> pd.DataFrame:
     """Uma linha a cada N minutos, de janela_inicio a janela_fim (inclusive), por pregão com dado.
 
+    A LSEG carimba a barra pelo início do intervalo e o valor é o do fim (conferido contra o tick em 26/11/2026):
+    a barra carimbada 10:10 traz a última oferta antes das 10:15. Por isso o horário da linha é carimbo + N
+    minutos, o instante da foto.
     Barra sem atualização repete o último valor do mesmo dia, campo a campo. As barras do próprio dia entre a
     abertura do pregão contínuo e o início da janela servem de ponto de partida; as do leilão de abertura, não.
     Antes da primeira oferta do dia a linha fica vazia (nunca zero). Nada é filtrado.
@@ -353,14 +371,15 @@ def montar_grade(df_utc: pd.DataFrame, ticker: str, cfg) -> pd.DataFrame:
     if df_utc.empty:
         return _grade_vazia()
     nomes = {api: col for col, api in cfg["campos"].items()}
-    loc = df_utc.tz_convert(TZ).tz_localize(None)
     passo = pd.Timedelta(minutes=cfg["intervalo_min"])
+    loc = df_utc.tz_convert(TZ).tz_localize(None)
+    loc.index = loc.index + passo  # carimbo (início) -> horário da foto (fim do intervalo)
     partes = []
-    for dia, g in loc.groupby(loc.index.date):
+    for dia, g in loc.groupby((loc.index - pd.Timedelta(seconds=1)).date):  # foto das 00:00 é do dia anterior
         ta = pd.Timestamp(dt.datetime.combine(dia, cfg["abertura_continuo"]))
         t0 = pd.Timestamp(dt.datetime.combine(dia, cfg["janela_inicio"]))
         t1 = pd.Timestamp(dt.datetime.combine(dia, cfg["janela_fim"]))
-        g = g[(g.index >= ta) & (g.index <= t1)]
+        g = g[(g.index > ta) & (g.index <= t1)]  # foto das 10:00 ainda é leilão; a das 10:05 já é contínuo
         if g.empty:
             continue  # nenhuma barra no pregão: dia sem negociação (feriado, por exemplo)
         grade = pd.date_range(t0, t1, freq=passo)
@@ -370,6 +389,112 @@ def montar_grade(df_utc: pd.DataFrame, ticker: str, cfg) -> pd.DataFrame:
         r.index.name = "data_hora"
         partes.append(r.reset_index())
     return pd.concat(partes, ignore_index=True) if partes else _grade_vazia()
+
+
+# --------------------------------------------------------------------------------------------
+# Quantidades no topo do livro, pelo tick a tick
+# --------------------------------------------------------------------------------------------
+def baixar_tick(ld, ric, ini_utc, fim_utc, pausa) -> pd.DataFrame:
+    """Tick de [ini, fim). Se a resposta parecer cortada (muitas linhas e um buraco numa das pontas), divide."""
+    df = chamar_api(ld, ric, CAMPOS_TICK, "tick", ini_utc, fim_utc, pausa, anotar=False)
+    folga = pd.Timedelta(minutes=2)
+    if len(df) >= 5000 and fim_utc - ini_utc > pd.Timedelta(minutes=10) and \
+            (df.index.min() > ini_utc + folga or df.index.max() < fim_utc - folga):
+        meio = ini_utc + (fim_utc - ini_utc) / 2
+        df = pd.concat([baixar_tick(ld, ric, ini_utc, meio, pausa), baixar_tick(ld, ric, meio, fim_utc, pausa)])
+    df = df[(df.index >= ini_utc) & (df.index < fim_utc)]
+    return df[~df.index.isna()]
+
+
+def tick_do_dia(ld, ric, dia, cfg):
+    """Fotos do topo do livro nos horários da grade de um pregão, a partir do tick.
+
+    Em cada horário da linha, BID/ASK/BIDSIZE/ASKSIZE do último evento ANTES dele, no mesmo pregão e depois da
+    abertura do contínuo: a mesma regra da barra de 5 minutos. Devolve (fotos, eventos); fotos vazio = sem tick.
+    """
+    passo = pd.Timedelta(minutes=cfg["intervalo_min"])
+    ta = pd.Timestamp(dt.datetime.combine(dia, cfg["abertura_continuo"]))
+    t0 = pd.Timestamp(dt.datetime.combine(dia, cfg["janela_inicio"]))
+    t1 = pd.Timestamp(dt.datetime.combine(dia, cfg["janela_fim"]))
+    grade = pd.date_range(t0, t1, freq=passo)
+    partes, a = [], ta
+    while a < t1:  # uma hora por chamada (a hora mais cheia do BOVA11 tem ~33 mil eventos)
+        b = min(a + pd.Timedelta(hours=1), t1)
+        partes.append(baixar_tick(ld, ric, a.tz_localize(TZ).tz_convert("UTC"), b.tz_localize(TZ).tz_convert("UTC"),
+                                  cfg["pausa_tick_seg"]))
+        a = b
+    tk = pd.concat(partes) if partes else _vazio(CAMPOS_TICK)
+    if tk.empty:
+        return pd.DataFrame(), 0
+    loc = tk.tz_convert(TZ).tz_localize(None)
+    loc = loc[loc.index > ta].sort_index(kind="stable").ffill()  # ffill campo a campo, só dentro do dia
+    pos = loc.index.searchsorted(grade, side="left") - 1  # último evento estritamente antes do horário
+    fotos = pd.DataFrame(np.nan, index=grade, columns=CAMPOS_TICK)
+    ok = pos >= 0
+    fotos.loc[ok] = loc[CAMPOS_TICK].to_numpy()[pos[ok]]
+    fotos.index.name = "data_hora"
+    return fotos, len(tk)
+
+
+def quantidades_tick(ld, ric, ticker, dias, cfg):
+    """Fotos do tick para os pregões do ETF dentro da janela do tick, do mais recente para o mais antigo.
+
+    Para de voltar quando 3 pregões seguidos não trazem tick (acabou o histórico). Pregão fechado com dado fica
+    em cache (cache\\tick). Devolve (fotos de todos os dias, resumo).
+    """
+    pasta = PASTA / "cache" / "tick"
+    pasta.mkdir(parents=True, exist_ok=True)
+    hoje = pd.Timestamp.today().normalize().date()
+    limite = (pd.Timestamp.today().normalize() - pd.Timedelta(days=cfg["tick_dias_max"])).date()
+    janela = f"{cfg['abertura_continuo']:%H%M}-{cfg['janela_fim']:%H%M}_{cfg['intervalo_min']}min"
+    fotos, com_tick, erros = [], [], []
+    vazios_seguidos = eventos = 0
+    t_ini = time.time()
+    for n, dia in enumerate(sorted(dias, reverse=True), 1):
+        if dia < limite or vazios_seguidos >= 3:
+            break
+        arq = pasta / f"{ric.replace('.', '_')}_{dia:%Y%m%d}_{janela}.csv"
+        f = None
+        if cfg["usar_cache"] and arq.exists() and dia < hoje:
+            f = pd.read_csv(arq, index_col=0, parse_dates=True)
+        if f is None or f.empty:
+            try:
+                f, ev = tick_do_dia(ld, ric, dia, cfg)
+            except Exception as e:  # noqa: BLE001  (um dia com erro não para o ETF)
+                erros.append(dia)
+                log(f"   tick {ric} {dia:%d/%m/%Y}: erro ({e}); quantidade vazia nesse dia")
+                if len(erros) >= 3 and len(erros) == n:
+                    break  # errou nos 3 primeiros dias: desiste do tick deste ETF
+                continue
+            eventos += ev
+            if len(f) and f[["BIDSIZE", "ASKSIZE"]].notna().any().any() and dia < hoje:
+                f.to_csv(arq)
+        if len(f) and f[["BIDSIZE", "ASKSIZE"]].notna().any().any():
+            fotos.append(f)
+            com_tick.append(dia)
+            vazios_seguidos = 0
+        else:
+            vazios_seguidos += 1
+        if n % 5 == 0:
+            log(f"   tick {ticker}: {n} pregões lidos, {eventos:,} eventos, {time.time() - t_ini:.0f}s", so_tela=True)
+    res = {"tick_pregoes": len(com_tick), "tick_desde": min(com_tick) if com_tick else None,
+           "tick_ate": max(com_tick) if com_tick else None, "tick_eventos": eventos,
+           "tick_seg": time.time() - t_ini, "tick_erros": sorted(erros)}
+    return (pd.concat(fotos) if fotos else pd.DataFrame(columns=CAMPOS_TICK)), res
+
+
+def juntar_quantidades(t: pd.DataFrame, fotos: pd.DataFrame):
+    """Preenche qtd_compra/qtd_venda da grade com o tick (onde a barra não trouxe) e mede se o preço bate."""
+    if t.empty or fotos.empty:
+        return t, None
+    x = t.set_index("data_hora")
+    f = fotos.reindex(x.index)
+    x["qtd_compra"] = x["qtd_compra"].fillna(f["BIDSIZE"])
+    x["qtd_venda"] = x["qtd_venda"].fillna(f["ASKSIZE"])
+    ambos = f["BID"].notna() & f["ASK"].notna() & x["compra"].notna() & x["venda"].notna()
+    bate = ((f["BID"] - x["compra"]).abs() < 1e-6) & ((f["ASK"] - x["venda"]).abs() < 1e-6)
+    pct = float(bate[ambos].mean()) if ambos.any() else None
+    return x.reset_index(), pct
 
 
 def dias_faltando(tabelas: dict[str, pd.DataFrame], cfg):
@@ -446,7 +571,8 @@ def main():
             log(f"{etf.ticker} ({ric}, {origem})")
             item = {"ticker": etf.ticker, "ric": ric, "ric_origem": origem, "erro": "", "primeira_barra_periodo": "-",
                     "historico_desde": "-", "como": "", "pregoes": 0, "linhas": 0,
-                    "linhas_sem_compra_ou_venda": 0, "campos_vazios": []}
+                    "linhas_sem_compra_ou_venda": 0, "campos_vazios": [], "tick_pregoes": 0, "tick_bate": None,
+                    "tick_erros": [], "tick_desde": None, "tick_ate": None}
             try:
                 bruto = baixar_periodo(ld, ric, cfg)
                 primeira = bruto.index.min() if len(bruto) else None
@@ -457,6 +583,18 @@ def main():
                 log(f"   ERRO em {etf.ticker}: {e}")
                 resumo.append(item)
                 continue
+            if cfg["quantidade_tick"] and len(t):
+                fotos, res = quantidades_tick(ld, ric, etf.ticker, set(t["data_hora"].dt.date), cfg)
+                t, item["tick_bate"] = juntar_quantidades(t, fotos)
+                item.update(res)
+                if res["tick_pregoes"]:
+                    bate = (f"; preço do tick = preço da barra em {item['tick_bate']:.1%} das linhas"
+                            if item["tick_bate"] is not None else "")
+                    log(f"   {etf.ticker}: quantidades do tick em {res['tick_pregoes']} pregões "
+                        f"({res['tick_desde']:%d/%m/%Y} a {res['tick_ate']:%d/%m/%Y}), {res['tick_eventos']:,} eventos "
+                        f"baixados em {res['tick_seg']:.0f}s{bate}")
+                else:
+                    log(f"   {etf.ticker}: sem tick nos pregões do período (a LSEG guarda cerca de 3 meses)")
             tabelas[etf.ticker] = t
             item.update({
                 "primeira_barra_periodo": primeira.tz_convert(TZ).strftime("%d/%m/%Y %H:%M") if primeira is not None else "-",
@@ -602,8 +740,8 @@ def gravar_spread(base: pd.DataFrame, ordem: list[str], cfg, arq: Path) -> Path:
     det = det.sort_values(["ETF", "Data"])
 
     notas = [
-        "Spread de cada barra = (venda - compra) / ponto médio x 10.000, em bps, com a cotação do fim da barra "
-        f"de {cfg['intervalo_min']} minutos, de {cfg['janela_inicio']:%H:%M} a {cfg['janela_fim']:%H:%M}.",
+        "Spread de cada linha = (venda - compra) / ponto médio x 10.000, em bps, com a melhor oferta no horário da "
+        f"linha (foto a cada {cfg['intervalo_min']} minutos, de {cfg['janela_inicio']:%H:%M} a {cfg['janela_fim']:%H:%M}).",
         "Barra válida: compra > 0, venda > 0 e venda > compra. Livro cruzado/travado, oferta zerada ou vazia ficam "
         "fora da conta (no CSV bruto continuam).",
         f"Spread do dia = média das barras válidas do pregão; dia com menos de {cfg['min_barras_validas']} barras "
@@ -615,7 +753,8 @@ def gravar_spread(base: pd.DataFrame, ordem: list[str], cfg, arq: Path) -> Path:
     ]
     if tem_qtd:
         notas.append("Profundidade no topo: média de (qtd_compra + qtd_venda) / 2 nas barras válidas, em cotas; "
-                     "em R$ mil, cada lado vezes o seu preço.")
+                     "em R$ mil, cada lado vezes o seu preço. Só nos pregões com quantidade: ela vem do tick a tick, "
+                     "que a LSEG guarda por cerca de 3 meses.")
     notas += ["Fonte: LSEG Workspace. Dado bruto da LSEG: não redistribuir.",
               f"Gerado em {dt.datetime.now():%d/%m/%Y %H:%M}."]
 
@@ -693,9 +832,22 @@ def relatorio(cfg, resumo, faltas, ld, arq_csv, arq_spread, executado):
     vazio_em_todos = [c for c in COLUNAS[2:] if com_dado and all(c in x["campos_vazios"] for x in com_dado)]
     if vazio_em_todos:
         nomes = ", ".join(f"{campos[c]} (coluna {c})" for c in vazio_em_todos)
-        falhas.append(f"Vieram vazios em todos os ETFs: {nomes}. Na barra de {cfg['intervalo_min']} minutos a LSEG não "
-                      "traz quantidade no topo do livro (BIDSIZE/ASKSIZE só existem no dado tick a tick).")
+        if cfg["quantidade_tick"] and set(vazio_em_todos) <= set(COLS_QTD):
+            porque = ("As quantidades vêm do tick a tick, que a LSEG guarda por cerca de 3 meses: o período pedido "
+                      "está todo antes disso (ou o tick não respondeu; ver o log).")
+        elif set(vazio_em_todos) & set(COLS_QTD):
+            porque = (f"Na barra de {cfg['intervalo_min']} minutos a LSEG não traz quantidade no topo do livro "
+                      "(BIDSIZE/ASKSIZE só existem no tick a tick; quantidade_tick = S na aba Parametros liga).")
+        else:
+            porque = "Conferir o nome do campo no Data Item Browser (DIB)."
+        falhas.append(f"Vieram vazios em todos os ETFs: {nomes}. {porque}")
     for x in resumo:
+        if x.get("tick_erros"):
+            falhas.append(f"{x['ticker']}: o tick falhou em {len(x['tick_erros'])} pregão(ões), quantidade vazia "
+                          f"nesses dias: {_datas(x['tick_erros'])}")
+        if x.get("tick_bate") is not None and x["tick_bate"] < 0.95:
+            falhas.append(f"{x['ticker']}: o preço do tick bateu com o da barra em só {x['tick_bate']:.1%} das linhas "
+                          "(esperado perto de 100%). Conferir antes de usar as quantidades.")
         if x["erro"]:
             falhas.append(f"{x['ticker']} ({x['ric']}): erro na chamada, ETF fora do arquivo. {x['erro']}")
         elif x["pregoes"] == 0:
@@ -704,8 +856,12 @@ def relatorio(cfg, resumo, faltas, ld, arq_csv, arq_spread, executado):
                           + (f"A API respondeu: {msg.rstrip('.')}." if msg else "A API devolveu tabela vazia, sem mensagem.")
                           + f" RIC: {x.get('ric_origem', '')}. Conferir o RIC no Workspace e preencher a coluna ric da planilha.")
         for c in [c for c in x["campos_vazios"] if c not in vazio_em_todos]:
-            falhas.append(f"{x['ticker']}: o campo {campos[c]} (coluna {c}) veio vazio no período todo. "
-                          "Conferir o nome do campo no Data Item Browser (DIB).")
+            if c in COLS_QTD and cfg["quantidade_tick"]:
+                falhas.append(f"{x['ticker']}: sem quantidade (coluna {c}) no período todo: o tick não trouxe dado "
+                              "nos pregões dos últimos 3 meses.")
+            else:
+                falhas.append(f"{x['ticker']}: o campo {campos[c]} (coluna {c}) veio vazio no período todo. "
+                              "Conferir o nome do campo no Data Item Browser (DIB).")
     for t, dias in por_etf.items():
         falhas.append(f"{t}: {len(dias)} pregão(ões) sem dado, em que outros ETFs tiveram: {_datas(dias)}")
 
@@ -734,6 +890,19 @@ def relatorio(cfg, resumo, faltas, ld, arq_csv, arq_spread, executado):
         f"   interval = \"{cfg['intervalo_api']}\"",
         "   start/end = um mês calendário por chamada, em UTC (o mês é dividido se a resposta vier cortada).",
         "   Valor de cada barra: o último do intervalo, como a API devolve.",
+    ]
+    if cfg["quantidade_tick"]:
+        linhas += [
+            "   Quantidades (qtd_compra, qtd_venda): a barra de 5 minutos não traz BIDSIZE/ASKSIZE. Elas vêm de uma",
+            "   segunda chamada, get_history com interval = \"tick\" e fields = " + str(CAMPOS_TICK) + ", uma hora por",
+            f"   chamada, de {cfg['abertura_continuo']:%H:%M} a {cfg['janela_fim']:%H:%M}. Em cada linha, a quantidade do último "
+            "evento antes do horário da",
+            "   linha, no mesmo pregão (a mesma regra da barra). A LSEG guarda o tick por cerca de 3 meses (em",
+            "   26/11/2026 havia tick em 28/08/2026 e não em 29/07/2026): antes disso as quantidades ficam vazias.",
+        ]
+    else:
+        linhas.append("   Quantidades: quantidade_tick = N, só o que a barra trouxer (a barra de 5 minutos não traz).")
+    linhas += [
         "",
         "2. Desde quando o histórico intradiário existe",
     ]
@@ -753,8 +922,9 @@ def relatorio(cfg, resumo, faltas, ld, arq_csv, arq_spread, executado):
         f"   próprio dia entre {cfg['abertura_continuo']:%H:%M} e {cfg['janela_inicio']:%H:%M} servem de ponto de partida; "
         "as do leilão de abertura, não.",
         "   Se o dia ainda não tinha oferta até aquele horário, a linha fica vazia (nunca zero).",
-        "   Carimbo de hora: o da barra como a API devolve. Confirmar na documentação da LSEG se ele marca o",
-        "   início ou o fim do intervalo (muda em 5 minutos a leitura de cada linha).",
+        f"   Horário da linha = instante da foto: a linha das 10:15 traz a última oferta antes das 10:15. A LSEG",
+        f"   carimba a barra pelo início do intervalo (a barra 10:10 vai de 10:10 a 10:15), então a linha é carimbo",
+        f"   + {cfg['intervalo_min']} min. Conferido contra o tick em 26/11/2026: 12 de 12 barras do BOVA11.",
         "   Nenhum outro filtro (livro cruzado, oferta zerada etc. vão como vieram).",
         "   CSV: UTF-8, vírgula como separador, ponto decimal, sem coluna de índice; preços com 2 casas e",
         "   quantidades (cotas) inteiras.",
@@ -765,8 +935,14 @@ def relatorio(cfg, resumo, faltas, ld, arq_csv, arq_spread, executado):
         if x["erro"]:
             linhas.append(f"   {x['ticker']} ({x['ric']}): erro, fora do arquivo")
         else:
+            q = ""
+            if cfg["quantidade_tick"]:
+                q = (f"; quantidade do tick em {x['tick_pregoes']} pregões ({x['tick_desde']:%d/%m/%Y} a "
+                     f"{x['tick_ate']:%d/%m/%Y})" if x.get("tick_pregoes") else "; sem quantidade (sem tick)")
+                if x.get("tick_bate") is not None:
+                    q += f", preço do tick = da barra em {x['tick_bate']:.1%} das linhas"
             linhas.append(f"   {x['ticker']} ({x['ric']}): {x['pregoes']} pregões, {x['linhas']} linhas, "
-                          f"{x['linhas_sem_compra_ou_venda']} linhas sem compra ou venda")
+                          f"{x['linhas_sem_compra_ou_venda']} linhas sem compra ou venda{q}")
     linhas += [
         "",
         "5. Campo diário pronto de spread médio",
