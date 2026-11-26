@@ -88,7 +88,8 @@ def ler_entrada(caminho: Path, forcar_mes_anterior: bool = False):
     etfs["ticker"] = etfs["ticker"].str.strip().str.upper().str.replace(".SA", "", regex=False)
     etfs = etfs[etfs["ticker"] != ""]
     etfs = etfs[etfs["ativo"].map(_sim) | (etfs["ativo"].str.strip() == "")].copy()
-    etfs["ric"] = [r.strip() if r.strip() else f"{t}.SA" for t, r in zip(etfs["ticker"], etfs["ric"])]
+    etfs["ric_planilha"] = etfs["ric"].str.strip()  # em branco = o script descobre (.SA ou =SA)
+    etfs["ric"] = [r if r else f"{t}.SA" for t, r in zip(etfs["ticker"], etfs["ric_planilha"])]
     etfs = etfs.drop_duplicates("ticker").reset_index(drop=True)
     if etfs.empty:
         raise SystemExit("Nenhum ETF ativo na aba ETFs.")
@@ -264,6 +265,23 @@ def meses(ini: pd.Timestamp, fim_incl: pd.Timestamp):
         a = b
 
 
+def resolver_ric(ld, ticker, ric_planilha, pausa):
+    """RIC do ETF na LSEG. Se a planilha não informa, testa os dois formatos da B3.
+
+    ETF de ações é <ticker>.SA (BOVA11.SA); ETF de renda fixa ("Bond ETF" na LSEG) é <ticker>=SA (LFTS11=SA).
+    O teste é uma chamada diária curta: o primeiro formato que devolve dado fica.
+    """
+    if ric_planilha:
+        return ric_planilha, "informado na planilha"
+    fim = pd.Timestamp.now("UTC").normalize()
+    for cand in (f"{ticker}.SA", f"{ticker}=SA"):
+        df = chamar_api(ld, cand, ["BID"], "daily", fim - pd.Timedelta(days=30), fim, pausa)
+        if len(df):
+            RESPOSTAS_VAZIAS.pop(cand, None)
+            return cand, "descoberto pelo script"
+    return f"{ticker}.SA", f"nenhum formato respondeu ({ticker}.SA nem {ticker}=SA)"
+
+
 def campos_da_chamada(cfg) -> list[str]:
     return [cfg["campos"][c] for c in COLUNAS]
 
@@ -421,14 +439,18 @@ def main():
     tabelas, resumo = {}, []
     try:
         for etf in etfs.itertuples():
-            log(f"{etf.ticker} ({etf.ric})")
-            item = {"ticker": etf.ticker, "ric": etf.ric, "erro": "", "primeira_barra_periodo": "-",
+            try:
+                ric, origem = resolver_ric(ld, etf.ticker, etf.ric_planilha, cfg["pausa_seg"])
+            except Exception as e:  # noqa: BLE001
+                ric, origem = etf.ric, f"teste do RIC falhou: {e}"
+            log(f"{etf.ticker} ({ric}, {origem})")
+            item = {"ticker": etf.ticker, "ric": ric, "ric_origem": origem, "erro": "", "primeira_barra_periodo": "-",
                     "historico_desde": "-", "como": "", "pregoes": 0, "linhas": 0,
                     "linhas_sem_compra_ou_venda": 0, "campos_vazios": []}
             try:
-                bruto = baixar_periodo(ld, etf.ric, cfg)
+                bruto = baixar_periodo(ld, ric, cfg)
                 primeira = bruto.index.min() if len(bruto) else None
-                inicio_hist, como = sondar_inicio(ld, etf.ric, cfg, primeira)
+                inicio_hist, como = sondar_inicio(ld, ric, cfg, primeira)
                 t = montar_grade(bruto, etf.ticker, cfg)
             except Exception as e:  # noqa: BLE001  (um ETF com erro não derruba os outros)
                 item["erro"] = str(e)
@@ -666,6 +688,13 @@ def relatorio(cfg, resumo, faltas, ld, arq_csv, arq_spread, executado):
     campos = cfg["campos"]
 
     falhas = []
+    # campo vazio em todos os ETFs com dado: uma linha só (é o campo, não o ETF)
+    com_dado = [x for x in resumo if not x["erro"] and x["pregoes"]]
+    vazio_em_todos = [c for c in COLUNAS[2:] if com_dado and all(c in x["campos_vazios"] for x in com_dado)]
+    if vazio_em_todos:
+        nomes = ", ".join(f"{campos[c]} (coluna {c})" for c in vazio_em_todos)
+        falhas.append(f"Vieram vazios em todos os ETFs: {nomes}. Na barra de {cfg['intervalo_min']} minutos a LSEG não "
+                      "traz quantidade no topo do livro (BIDSIZE/ASKSIZE só existem no dado tick a tick).")
     for x in resumo:
         if x["erro"]:
             falhas.append(f"{x['ticker']} ({x['ric']}): erro na chamada, ETF fora do arquivo. {x['erro']}")
@@ -673,8 +702,8 @@ def relatorio(cfg, resumo, faltas, ld, arq_csv, arq_spread, executado):
             msg = RESPOSTAS_VAZIAS.get(x["ric"])
             falhas.append(f"{x['ticker']} ({x['ric']}): sem nenhum dado no período. "
                           + (f"A API respondeu: {msg.rstrip('.')}." if msg else "A API devolveu tabela vazia, sem mensagem.")
-                          + " Conferir o RIC e a permissão de intradiário na LSEG.")
-        for c in x["campos_vazios"]:
+                          + f" RIC: {x.get('ric_origem', '')}. Conferir o RIC no Workspace e preencher a coluna ric da planilha.")
+        for c in [c for c in x["campos_vazios"] if c not in vazio_em_todos]:
             falhas.append(f"{x['ticker']}: o campo {campos[c]} (coluna {c}) veio vazio no período todo. "
                           "Conferir o nome do campo no Data Item Browser (DIB).")
     for t, dias in por_etf.items():
@@ -699,7 +728,8 @@ def relatorio(cfg, resumo, faltas, ld, arq_csv, arq_spread, executado):
     linhas += [f"   {c} = {campos[c]}" for c in COLUNAS]
     linhas += [
         f"   Biblioteca: {versao_biblioteca(ld)}, função get_history.",
-        f"   universe = <RIC> (ex.: {resumo[0]['ric'] if resumo else 'BOVA11.SA'})",
+        "   universe = <RIC>: ETF de ações é <ticker>.SA (BOVA11.SA); ETF de renda fixa é <ticker>=SA (LFTS11=SA).",
+        "   Com a coluna ric da planilha em branco, o script testa os dois formatos; o RIC usado está na seção 4.",
         f"   fields = {campos_da_chamada(cfg)}",
         f"   interval = \"{cfg['intervalo_api']}\"",
         "   start/end = um mês calendário por chamada, em UTC (o mês é dividido se a resposta vier cortada).",
@@ -733,9 +763,9 @@ def relatorio(cfg, resumo, faltas, ld, arq_csv, arq_spread, executado):
     ]
     for x in resumo:
         if x["erro"]:
-            linhas.append(f"   {x['ticker']}: erro, fora do arquivo")
+            linhas.append(f"   {x['ticker']} ({x['ric']}): erro, fora do arquivo")
         else:
-            linhas.append(f"   {x['ticker']}: {x['pregoes']} pregões, {x['linhas']} linhas, "
+            linhas.append(f"   {x['ticker']} ({x['ric']}): {x['pregoes']} pregões, {x['linhas']} linhas, "
                           f"{x['linhas_sem_compra_ou_venda']} linhas sem compra ou venda")
     linhas += [
         "",
