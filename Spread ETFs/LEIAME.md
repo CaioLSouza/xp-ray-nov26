@@ -5,7 +5,7 @@ Baixa as barras intraday dos ETFs listados na planilha e entrega um CSV bruto no
 ## Arquivos
 - `inputs_spread_etfs.xlsx`: a planilha que você edita (células amarelas).
   - aba **ETFs**: um ticker por linha, sem o `.SA` (hoje são 21).
-    - O RIC padrão é `<ticker>.SA`; preencha a coluna `ric` só se for diferente.
+    - Com a coluna `ric` em branco, o script descobre o RIC sozinho: ETF de ações é `<ticker>.SA` (BOVA11.SA) e ETF de renda fixa, que a LSEG chama de "Bond ETF", é `<ticker>=SA` (LFTS11=SA). Preencha a coluna só se nenhum dos dois servir.
     - `ativo = N` tira o ETF da rodada sem apagar a linha.
   - aba **Parametros**:
     - período;
@@ -94,7 +94,8 @@ Cada período tem o seu nome de arquivo, então uma rodada mensal não sobrescre
 
 ## Pontos a confirmar na primeira rodada
 - **Campos de quantidade:** na 1ª rodada real (25/11/2026), `BIDSIZE` e `ASKSIZE` vieram vazios em todos os ETFs na barra de 5 minutos. A suspeita é que a barra resumida da LSEG não traga quantidade, só o tick. O `diagnostico_ric.py` testa as duas coisas.
-- **ETFs de renda fixa e caixa:** na mesma rodada, os 15 voltaram sem nenhuma barra. Agora o relatório mostra a mensagem da API (RIC não encontrado, sem permissão etc.).
+- **ETFs de renda fixa e caixa:** na mesma rodada, os 15 voltaram sem nenhuma barra. O `diagnostico_ric.py` mostrou que o RIC deles é `<ticker>=SA`, e o script agora testa os dois formatos.
+- **Quantidades pelo tick:** o `diagnostico_tick.py` mede até onde vai o histórico tick a tick, quanto ele pesa e se o carimbo da barra marca o início ou o fim dos 5 minutos.
 - **Carimbo de hora:** ver se o da barra marca o início ou o fim dos 5 minutos (documentação da LSEG).
 - **Campo diário de spread médio:** se existe um pronto, só como referência. O script não verifica; buscar "spread" no DIB e ler a definição.
 
